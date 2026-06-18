@@ -147,7 +147,7 @@ The core innovation: **making small models act big through external scaffolding*
 
 ## 📜 License
 
-MIT © AFKmoney 2025
+MIT © AFKmoney 2026
 
 ## 🙏 Credits
 

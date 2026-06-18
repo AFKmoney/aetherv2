@@ -1,0 +1,772 @@
+     1→     1→//! # Agent — the autonomous OS-management agentic loop.
+     2→     2→//!
+     3→     3→//! This module is the **brain** of the autonomous OS layer. It implements
+     4→     4→//! the classical perceive → think → act → observe control loop on top of
+     5→     5→//! the Aether Engine's existing inference pipeline, turning a small GGUF
+     6→     6→//! model into an autonomous agent capable of managing a Linux-like OS:
+     7→     7→//!
+     8→     8→//! 1. **Perceive** — receive the current OS state (open windows, memory
+     9→     9→//!    snapshot, active plan, goals) as a `context` JSON object.
+    10→    10→//! 2. **Think** — call the LLM through the engine's OpenAI-compatible
+    11→    11→//!    backend, primed with a system prompt that frames the model as an
+    12→    12→//!    autonomous OS agent and lists every available tool's schema.
+    13→    13→//! 3. **Act** — parse the LLM's response for tool calls (see
+    14→    14→//!    [`parse_tool_calls`], which supports both bare inline JSON and
+    15→    15→//!    fenced-code-block formats).
+    16→    16→//! 4. **Execute** — dispatch each parsed [`ToolCall`] through the
+    17→    17→//!    [`ToolRegistry`](crate::tools::ToolRegistry); on success, capture the
+    18→    18→//!    tool's output. On failure (unknown tool, invalid params, executor
+    19→    19→//!    error), capture a diagnostic instead.
+    20→    20→//! 5. **Observe** — feed every tool result back into the message stream as
+    21→    21→//!    a new tool-role message, so the LLM sees the consequence of its
+    22→    22→//!    action on the next think step.
+    23→    23→//! 6. **Repeat** — continue until the LLM emits the `TASK_COMPLETE` sentinel,
+    24→    24→//!    emits a response with no tool calls, or the iteration cap is hit.
+    25→    25→//!
+    26→    26→//! # Architecture
+    27→    27→//!
+    28→    28→//! ```text
+    29→    29→//!                 ┌─────────────────────────────┐
+    30→    30→//!   goal ───────▶│  run_agent_loop              │
+    31→    31→//!   context ────▶│  ┌────────────────────────┐  │
+    32→    32→//!                 │  │ 1. Perceive (state)    │  │
+    33→    33→//!                 │  │ 2. Think  (LLM call)   │  │
+    34→    34→//!                 │  │ 3. Act    (parse calls)│  │
+    35→    35→//!                 │  │ 4. Execute (registry)  │  │
+    36→    36→//!                 │  │ 5. Observe (feed back) │  │
+    37→    37→//!                 │  │ 6. Repeat / stop       │  │
+    38→    38→//!                 │  └────────────────────────┘  │
+    39→    39→//!                 │  ──▶ AgentRunResult           │
+    40→    40→//!                 └─────────────────────────────┘
+    41→    41→//! ```
+    42→    42→//!
+    43→    43→//! The loop is **stateless across requests**: every `POST /v1/agent/run`
+    44→    44→//! call starts a fresh [`AgentState`]. Persistence (memory, plans, goals)
+    45→    45→//! is delegated to the existing Aether Engine endpoints (`/graph/add`,
+    46→    46→//! `/graph/search`) and to the Next.js layer's plan store. The `context`
+    47→    47→//! field on the request body is the bridge — the caller assembles the
+    48→    48→//! current OS snapshot into it before each call.
+    49→    49→//!
+    50→    50→//! # Why this lives in the inference engine
+    51→    51→//!
+    52→    52→//! Putting the agent loop in the Aether Engine (rather than the Next.js
+    53→    53→//! layer) means the loop benefits from all ten engine innovations: every
+    54→    54→//! think step's system prompt can be augmented by graph retrieval, every
+    55→    55→//! repeated goal can hit the action cache, every complex step can be
+    56→    56→//! decomposed, and every response is ATD-verified. The agent loop is a
+    57→    57→//! *client* of the cognitive pipeline, not a replacement for it.
+    58→    58→//!
+    59→    59→//! # Termination
+    60→    60→//!
+    61→    61→//! The loop stops when any of the following is true:
+    62→    62→//!
+    63→    63→//! - The LLM's response contains the literal `TASK_COMPLETE` sentinel
+    64→    64→//!   (case-sensitive). `completed` is set to `true`.
+    65→    65→//! - The LLM's response contains no parseable tool calls. `completed` is
+    66→    66→//!   `false` (the agent stopped without an explicit completion signal).
+    67→    67→//! - `max_iterations` is reached. `completed` is `false`.
+    68→    68→//!
+    69→    69→//! The caller decides what to do with an incomplete result (retry, surface
+    70→    70→//! to the user, etc.).
+    71→    71→
+    72→    72→use crate::tools::{Tool, ToolRegistry};
+    73→    73→use crate::AppState;
+    74→    74→use serde::{Deserialize, Serialize};
+    75→    75→use serde_json::{json, Value};
+    76→    76→
+    77→    77→// ---------------------------------------------------------------------------
+    78→    78→// Core data types
+    79→    79→// ---------------------------------------------------------------------------
+    80→    80→
+    81→    81→/// A single message in the agent's conversation log.
+    82→    82→///
+    83→    83→/// Roles mirror the OpenAI chat-completions spec, with one extension:
+    84→    84→/// `tool` is used for tool-result messages so the caller can distinguish
+    85→    85→/// them from ordinary user messages in the log. When serialized for the
+    86→    86→/// backend LLM call ([`AgentMessage::to_request_json`]), `tool` messages
+    87→    87→/// are rewritten to `user` role with a `[tool_result: <tool>]` prefix,
+    88→    88→/// because small GGUF models frequently reject the `tool` role without a
+    89→    89→/// matching `tool_call_id`. The semantic content is preserved.
+    90→    90→#[derive(Clone, Debug, Serialize, Deserialize)]
+    91→    91→pub struct AgentMessage {
+    92→    92→    /// `"system"`, `"user"`, `"assistant"`, or `"tool"`.
+    93→    93→    pub role: String,
+    94→    94→    /// The message text. For `tool` messages this is the tool's output.
+    95→    95→    pub content: String,
+    96→    96→    /// For `tool` messages: the name of the tool that produced this output.
+    97→    97→    /// `None` for all other roles.
+    98→    98→    #[serde(skip_serializing_if = "Option::is_none")]
+    99→    99→    pub name: Option<String>,
+   100→   100→}
+   101→   101→
+   102→   102→impl AgentMessage {
+   103→   103→    /// Construct a `system` message.
+   104→   104→    pub fn system(content: impl Into<String>) -> Self {
+   105→   105→        Self {
+   106→   106→            role: "system".to_string(),
+   107→   107→            content: content.into(),
+   108→   108→            name: None,
+   109→   109→        }
+   110→   110→    }
+   111→   111→
+   112→   112→    /// Construct a `user` message.
+   113→   113→    pub fn user(content: impl Into<String>) -> Self {
+   114→   114→        Self {
+   115→   115→            role: "user".to_string(),
+   116→   116→            content: content.into(),
+   117→   117→            name: None,
+   118→   118→        }
+   119→   119→    }
+   120→   120→
+   121→   121→    /// Construct an `assistant` message (the LLM's prior response).
+   122→   122→    pub fn assistant(content: impl Into<String>) -> Self {
+   123→   123→        Self {
+   124→   124→            role: "assistant".to_string(),
+   125→   125→            content: content.into(),
+   126→   126→            name: None,
+   127→   127→        }
+   128→   128→    }
+   129→   129→
+   130→   130→    /// Construct a `tool` message capturing a tool's output. `tool_name`
+   131→   131→    /// is recorded in [`name`](Self::name) and used to prefix the content
+   132→   132→    /// when serializing for the backend.
+   133→   133→    pub fn tool(tool_name: impl Into<String>, content: impl Into<String>) -> Self {
+   134→   134→        Self {
+   135→   135→            role: "tool".to_string(),
+   136→   136→            content: content.into(),
+   137→   137→            name: Some(tool_name.into()),
+   138→   138→        }
+   139→   139→    }
+   140→   140→
+   141→   141→    /// Serialize this message into the OpenAI chat-completions `messages[]`
+   142→   142→    /// shape for the backend LLM call. See the type docs for the `tool` →
+   143→   143→    /// `user` rewrite rationale.
+   144→   144→    pub fn to_request_json(&self) -> Value {
+   145→   145→        match self.role.as_str() {
+   146→   146→            "tool" => json!({
+   147→   147→                "role": "user",
+   148→   148→                "content": format!(
+   149→   149→                    "[tool_result: {}] {}",
+   150→   150→                    self.name.as_deref().unwrap_or("unknown"),
+   151→   151→                    self.content
+   152→   152→                ),
+   153→   153→            }),
+   154→   154→            other => json!({
+   155→   155→                "role": other,
+   156→   156→                "content": self.content,
+   157→   157→            }),
+   158→   158→        }
+   159→   159→    }
+   160→   160→}
+   161→   161→
+   162→   162→/// A parsed tool call extracted from the LLM's response text.
+   163→   163→///
+   164→   164→/// Constructed by [`parse_tool_calls`]. The `name` field is matched
+   165→   165→/// against [`Tool::from_request`] to build a typed [`Tool`] before
+   166→   166→/// execution; an unknown name yields a `tool_not_found` diagnostic
+   167→   167→/// instead of a real execution.
+   168→   168→#[derive(Clone, Debug, Serialize, Deserialize)]
+   169→   169→pub struct ToolCall {
+   170→   170→    /// Canonical tool name (e.g. `"file_read"`, `"exec"`).
+   171→   171→    pub name: String,
+   172→   172→    /// JSON parameters object as parsed from the LLM payload.
+   173→   173→    pub params: Value,
+   174→   174→}
+   175→   175→
+   176→   176→/// The result of executing one [`ToolCall`]. Captured into
+   177→   177→/// [`AgentState::tool_results`] and fed back to the LLM as a `tool`-role
+   178→   178→/// [`AgentMessage`] on the next iteration.
+   179→   179→#[derive(Clone, Debug, Serialize, Deserialize)]
+   180→   180→pub struct ToolResult {
+   181→   181→    /// Name of the tool that produced this result (echoed back from the
+   182→   182→    /// [`ToolCall::name`] that triggered it).
+   183→   183→    pub tool: String,
+   184→   184→    /// Human/LLM-readable output string. On failure this is a diagnostic
+   185→   185→    /// message (`"tool_not_found: …"`, `"invalid_params: …"`, …).
+   186→   186→    pub output: String,
+   187→   187→    /// `true` when the tool executor returned success, `false` on any kind
+   188→   188→    /// of failure (unknown tool, bad params, executor error).
+   189→   189→    pub success: bool,
+   190→   190→}
+   191→   191→
+   192→   192→/// The LLM's response on one think step. Parsed from the raw backend
+   193→   193→/// response text by [`extract_assistant_content`]; the optional
+   194→   194→/// `tool_calls` field is filled in by the caller using
+   195→   195→/// [`parse_tool_calls`].
+   196→   196→#[derive(Clone, Debug)]
+   197→   197→pub struct AgentResponse {
+   198→   198→    /// The full assistant text. May contain zero or more tool-call JSON
+   199→   199→    /// payloads plus free-form reasoning.
+   200→   200→    pub text: String,
+   201→   201→    /// Tool calls parsed from `text`. Empty when the LLM made no tool
+   202→   202→    /// calls this iteration.
+   203→   203→    pub tool_calls: Vec<ToolCall>,
+   204→   204→}
+   205→   205→
+   206→   206→/// Mutable state carried across iterations of the agent loop.
+   207→   207→///
+   208→   208→/// A fresh [`AgentState`] is constructed at the top of
+   209→   209→/// [`run_agent_loop`]; each iteration reads from it (messages → LLM call)
+   210→   210→/// and writes to it (append assistant + tool messages, append tool
+   211→   211→/// results, bump iteration counter, set `completed` on termination).
+   212→   212→#[derive(Clone, Debug)]
+   213→   213→pub struct AgentState {
+   214→   214→    /// 1-indexed iteration counter. `0` before the first think step.
+   215→   215→    pub iteration: usize,
+   216→   216→    /// The full message stream: `[system, user(goal), assistant, tool,
+   217→   217→    /// assistant, tool, …]`.
+   218→   218→    pub messages: Vec<AgentMessage>,
+   219→   219→    /// Every tool result produced so far, in execution order. Used by the
+   220→   220→    /// handler to surface a transcript of what the agent did.
+   221→   221→    pub tool_results: Vec<ToolResult>,
+   222→   222→    /// `true` only when the LLM emitted the `TASK_COMPLETE` sentinel.
+   223→   223→    pub completed: bool,
+   224→   224→}
+   225→   225→
+   226→   226→/// Final return value of [`run_agent_loop`]. Serialized by the
+   227→   227→/// `POST /v1/agent/run` handler into the HTTP response.
+   228→   228→#[derive(Clone, Debug, Serialize, Deserialize)]
+   229→   229→pub struct AgentRunResult {
+   230→   230→    /// The last assistant response text (or an error/diagnostic string if
+   231→   231→    /// the backend was unreachable on the final iteration).
+   232→   232→    pub result: String,
+   233→   233→    /// Number of think iterations executed (1-indexed; matches
+   234→   234→    /// [`AgentState::iteration`] at loop exit).
+   235→   235→    pub iterations: usize,
+   236→   236→    /// Every tool call the LLM made across all iterations, in order.
+   237→   237→    /// Useful for UIs that want to render a transcript of the agent's
+   238→   238→    /// actions.
+   239→   239→    pub tool_calls: Vec<ToolCall>,
+   240→   240→    /// `true` when the LLM explicitly signaled completion via
+   241→   241→    /// `TASK_COMPLETE`. `false` when the loop exited due to no-tool-calls
+   242→   242→    /// or `max_iterations`.
+   243→   243→    pub completed: bool,
+   244→   244→}
+   245→   245→
+   246→   246→// ---------------------------------------------------------------------------
+   247→   247→// Sentinel: the LLM emits this literal string (case-sensitive) to signal
+   248→   248→// that the goal has been achieved and the loop should stop.
+   249→   249→// ---------------------------------------------------------------------------
+   250→   250→
+   251→   251→/// Sentinel the LLM emits (anywhere in its response) to signal that the
+   252→   252→/// goal is achieved and the loop should stop. Case-sensitive. Documented
+   253→   253→/// in [`build_agent_system_prompt`].
+   254→   254→pub const TASK_COMPLETE_SENTINEL: &str = "TASK_COMPLETE";
+   255→   255→
+   256→   256→/// Default iteration cap. Overridable per request via the
+   257→   257→/// `max_iterations` field on `POST /v1/agent/run`.
+   258→   258→pub const DEFAULT_MAX_ITERATIONS: usize = 20;
+   259→   259→
+   260→   260→/// Hard upper bound on iterations, enforced regardless of what the caller
+   261→   261→/// passes. Prevents a runaway agent from burning CPU forever against a
+   262→   262→/// broken backend.
+   263→   263→pub const ABSOLUTE_MAX_ITERATIONS: usize = 50;
+   264→   264→
+   265→   265→// ---------------------------------------------------------------------------
+   266→   266→// System prompt construction
+   267→   267→// ---------------------------------------------------------------------------
+   268→   268→
+   269→   269→/// Build the system prompt that frames the LLM as an autonomous OS agent
+   270→   270→/// with access to the supplied `tool_catalog` and the supplied OS `context`.
+   271→   271→///
+   272→   272→/// The prompt is split into five sections:
+   273→   273→///
+   274→   274→/// 1. **Identity** — "You are the autonomous agent core of Alpha-OS."
+   275→   275→/// 2. **Goal protocol** — how to call tools (JSON object format), and how
+   276→   276→///    to signal completion (`TASK_COMPLETE`).
+   277→   277→/// 3. **Available tools** — one block per tool with name + description +
+   278→   278→///    JSON Schema.
+   279→   279→/// 4. **Current OS state** — the `context` JSON pretty-printed, so the
+   280→   280→///    LLM perceives the open windows, memory snapshot, active plan, etc.
+   281→   281→/// 5. **Operating principles** — minimal, focused guidance: act
+   282→   282→///    deliberately, verify with `memory_search`, persist lessons with
+   283→   283→///    `memory_add`, decompose with `plan_create` before complex actions.
+   284→   284→///
+   285→   285→/// `context` is interpolated as pretty-printed JSON. If `context` is not
+   286→   286→/// an object, it is wrapped in `{ "context": <value> }` so the prompt
+   287→   287→/// always renders a stable shape.
+   288→   288→pub fn build_agent_system_prompt(tool_catalog: &[crate::tools::ToolSpec], context: &Value) -> String {
+   289→   289→    // Render the tool catalog as one block per tool.
+   290→   290→    let mut tool_blocks = String::with_capacity(8 * 1024);
+   291→   291→    for spec in tool_catalog {
+   292→   292→        tool_blocks.push_str(&format!(
+   293→   293→            "### {name}\n{desc}\n\nParameters (JSON Schema):\n```json\n{schema}\n```\n\n",
+   294→   294→            name = spec.name,
+   295→   295→            desc = spec.description,
+   296→   296→            schema = serde_json::to_string_pretty(&spec.parameters)
+   297→   297→                .unwrap_or_else(|_| "{}".to_string()),
+   298→   298→        ));
+   299→   299→    }
+   300→   300→
+   301→   301→    // Render the OS context as pretty JSON. Wrap non-objects so the prompt
+   302→   302→    // shape is stable regardless of caller input.
+   303→   303→    let context_json = if context.is_object() && !context.is_array() {
+   304→   304→        serde_json::to_string_pretty(context).unwrap_or_else(|_| "{}".to_string())
+   305→   305→    } else {
+   306→   306→        serde_json::to_string_pretty(&json!({ "context": context }))
+   307→   307→            .unwrap_or_else(|_| "{}".to_string())
+   308→   308→    };
+   309→   309→
+   310→   310→    format!(
+   311→   311→        "# AETHER AUTONOMOUS AGENT — Alpha-OS Cognitive Core\n\
+   312→   312→         You are the autonomous agent core of Alpha-OS, a self-evolving Linux-like OS. \
+   313→   313→         You perceive the current OS state, reason about what to do, and act through tools. \
+   314→   314→         Your job is to achieve the user's goal by issuing tool calls and observing their results, \
+   315→   315→         iterating until the goal is complete.\n\n\
+   316→   316→         ## Goal protocol\n\
+   317→   317→         To call a tool, emit a JSON object anywhere in your response. The object MUST have a \
+   318→   318→         `tool` (or `name`) field set to one of the available tool names, and a `params` (or \
+   319→   319→         `arguments`) field containing the tool's parameters as a JSON object. You may emit \
+   320→   320→         multiple tool calls in a single response; they will be executed in order and their \
+   321→   321→         results fed back to you as `[tool_result: <tool>]` messages.\n\n\
+   322→   322→         Example:\n\
+   323→   323→         ```json\n\
+   324→   324→         {{\n\
+   325→   325→           \"tool\": \"file_read\",\n\
+   326→   326→           \"params\": {{ \"path\": \"/etc/hostname\" }}\n\
+   327→   327→         }}\n\
+   328→   328→         ```\n\n\
+   329→   329→         When — and only when — you have achieved the user's goal, emit the literal sentinel \
+   330→   330→         `{sentinel}` on its own line. Do not emit it unless the goal is fully achieved.\n\n\
+   331→   331→         ## Available tools\n\
+   332→   332→         {tool_blocks}\n\
+   333→   333→         ## Current OS state\n\
+   334→   334→         The following JSON snapshot describes the current state of the OS you are managing \
+   335→   335→         (open windows, memory, active plan, goals, etc.). Use it to ground your actions.\n\
+   336→   336→         ```json\n\
+   337→   337→         {context_json}\n\
+   338→   338→         ```\n\n\
+   339→   339→         ## Operating principles\n\
+   340→   340→         - Act deliberately: one logical action per iteration when possible.\n\
+   341→   341→         - Verify before trusting: use `memory_search` to recall relevant facts before \
+   342→   342→         destructive actions (`file_delete`, `exec` with side effects).\n\
+   343→   343→         - Persist lessons: use `memory_add` to record anything worth remembering for \
+   344→   344→         future iterations.\n\
+   345→   345→         - Decompose complexity: use `plan_create` for any goal with more than two steps, \
+   346→   346→         then `plan_update` as you complete each step.\n\
+   347→   347→         - Observe carefully: tool results arrive as `[tool_result: <tool>]` messages; \
+   348→   348→         read them before deciding the next action.\n\
+   349→   349→         - Stop only when done: emit `{sentinel}` when the goal is fully achieved.",
+   350→   350→        sentinel = TASK_COMPLETE_SENTINEL,
+   351→   351→        tool_blocks = tool_blocks,
+   352→   352→        context_json = context_json,
+   353→   353→    )
+   354→   354→}
+   355→   355→
+   356→   356→// ---------------------------------------------------------------------------
+   357→   357→// Tool-call parsing
+   358→   358→// ---------------------------------------------------------------------------
+   359→   359→
+   360→   360→/// Parse zero or more [`ToolCall`]s from the LLM's response text.
+   361→   361→///
+   362→   362→/// Supports every common emission format small GGUF models produce:
+   363→   363→///
+   364→   364→/// - **Inline JSON** — `{"tool": "file_read", "params": {"path": "…"}}`
+   365→   365→///   appearing anywhere in the response (including inside prose).
+   366→   366→/// - **Fenced code blocks** — ` ```json\n{…}\n``` ` or ` ```tool\n{…}\n``` `.
+   367→   367→///   The fenced content is scanned with the same JSON extractor.
+   368→   368→/// - **OpenAI function-call shape** — `{"function": {"name": "…",
+   369→   369→///   "arguments": "…"}}` (arguments may be a JSON string or object).
+   370→   370→/// - **Wrapper arrays** — `{"tool_calls": [{…}, {…}]}` expands to
+   371→   371→///   multiple calls.
+   372→   372→/// - **Alternate field names** — `name`/`tool_name` for the tool name;
+   373→   373→///   `arguments`/`args` for parameters.
+   374→   374→///
+   375→   375→/// The parser walks the response once, scanning for `{` and attempting to
+   376→   376→/// extract a balanced JSON object at each occurrence. String-literal
+   377→   377→/// braces (e.g. inside a `"```json\n…\n```"` code fence description) are
+   378→   378→/// correctly skipped via the in-string / escape flags. Every successfully
+   379→   379→/// parsed JSON object is then classified by [`value_to_tool_calls`] as a
+   380→   380→/// single call, an array of calls, or a non-tool object (ignored).
+   381→   381→///
+   382→   382→/// Returns the calls in source order. Duplicates are preserved (the LLM
+   383→   383→/// may legitimately emit the same call twice if the first attempt didn't
+   384→   384→/// return the expected result).
+   385→   385→pub fn parse_tool_calls(response: &str) -> Vec<ToolCall> {
+   386→   386→    let mut calls = Vec::new();
+   387→   387→    let bytes = response.as_bytes();
+   388→   388→    let mut i = 0;
+   389→   389→    while i < bytes.len() {
+   390→   390→        if bytes[i] == b'{' {
+   391→   391→            if let Some((json_str, end)) = extract_balanced_json(response, i) {
+   392→   392→                if let Ok(v) = serde_json::from_str::<Value>(&json_str) {
+   393→   393→                    calls.extend(value_to_tool_calls(&v));
+   394→   394→                }
+   395→   395→                // Skip past the balanced object whether or not it parsed.
+   396→   396→                // (A failed parse means malformed JSON; we still want to
+   397→   397→                // jump past it to avoid re-scanning its interior.)
+   398→   398→                i = end;
+   399→   399→                continue;
+   400→   400→            }
+   401→   401→        }
+   402→   402→        i += 1;
+   403→   403→    }
+   404→   404→    calls
+   405→   405→}
+   406→   406→
+   407→   407→/// Extract a balanced JSON object (including any nested braces) starting
+   408→   408→/// at `start` (which MUST point at a `{` byte). Returns the matched
+   409→   409→/// substring and the index *after* the closing `}`, or `None` if no
+   410→   410→/// balanced match is found before end-of-input.
+   411→   411→///
+   412→   412→/// Honors JSON string literals (`"…"`) and escape sequences (`\"`, `\\`,
+   413→   413→/// …) so braces inside strings don't affect depth counting.
+   414→   414→fn extract_balanced_json(s: &str, start: usize) -> Option<(String, usize)> {
+   415→   415→    let bytes = s.as_bytes();
+   416→   416→    if start >= bytes.len() || bytes[start] != b'{' {
+   417→   417→        return None;
+   418→   418→    }
+   419→   419→    let mut depth: i32 = 0;
+   420→   420→    let mut in_string = false;
+   421→   421→    let mut escape = false;
+   422→   422→    for i in start..bytes.len() {
+   423→   423→        let c = bytes[i];
+   424→   424→        if in_string {
+   425→   425→            if escape {
+   426→   426→                escape = false;
+   427→   427→            } else if c == b'\\' {
+   428→   428→                escape = true;
+   429→   429→            } else if c == b'"' {
+   430→   430→                in_string = false;
+   431→   431→            }
+   432→   432→        } else {
+   433→   433→            match c {
+   434→   434→                b'"' => in_string = true,
+   435→   435→                b'{' => depth += 1,
+   436→   436→                b'}' => {
+   437→   437→                    depth -= 1;
+   438→   438→                    if depth == 0 {
+   439→   439→                        return Some((s[start..=i].to_string(), i + 1));
+   440→   440→                    }
+   441→   441→                }
+   442→   442→                _ => {}
+   443→   443→            }
+   444→   444→        }
+   445→   445→    }
+   446→   446→    None
+   447→   447→}
+   448→   448→
+   449→   449→/// Classify a parsed JSON value as zero or more tool calls. Handles single
+   450→   450→/// calls, call arrays, and the `{"tool_calls": [...]}` wrapper.
+   451→   451→fn value_to_tool_calls(v: &Value) -> Vec<ToolCall> {
+   452→   452→    // Array of calls: [{...}, {...}]
+   453→   453→    if let Some(arr) = v.as_array() {
+   454→   454→        return arr.iter().filter_map(value_to_single_call).collect();
+   455→   455→    }
+   456→   456→    // Wrapper: {"tool_calls": [...]} or {"calls": [...]}
+   457→   457→    for wrapper_key in ["tool_calls", "calls"] {
+   458→   458→        if let Some(inner) = v.get(wrapper_key).and_then(|x| x.as_array()) {
+   459→   459→            return inner.iter().filter_map(value_to_single_call).collect();
+   460→   460→        }
+   461→   461→    }
+   462→   462→    // Single call
+   463→   463→    if let Some(c) = value_to_single_call(v) {
+   464→   464→        return vec![c];
+   465→   465→    }
+   466→   466→    Vec::new()
+   467→   467→}
+   468→   468→
+   469→   469→/// Convert a single JSON object to a [`ToolCall`]. Accepts the field-name
+   470→   470→/// aliases documented on [`parse_tool_calls`]. Returns `None` when the
+   471→   471→/// object doesn't look like a tool call (no `tool`/`name`/`tool_name`/
+   472→   472→/// `function.name` field).
+   473→   473→fn value_to_single_call(v: &Value) -> Option<ToolCall> {
+   474→   474→    // Direct format: {"tool": "...", "params": {...}}
+   475→   475→    let name = v
+   476→   476→        .get("tool")
+   477→   477→        .and_then(|x| x.as_str())
+   478→   478→        .or_else(|| v.get("name").and_then(|x| x.as_str()))
+   479→   479→        .or_else(|| v.get("tool_name").and_then(|x| x.as_str()));
+   480→   480→
+   481→   481→    if let Some(name) = name {
+   482→   482→        let params = v
+   483→   483→            .get("params")
+   484→   484→            .cloned()
+   485→   485→            .or_else(|| v.get("arguments").cloned())
+   486→   486→            .or_else(|| v.get("args").cloned())
+   487→   487→            .filter(Value::is_object)
+   488→   488→            .unwrap_or_else(|| json!({}));
+   489→   489→        return Some(ToolCall {
+   490→   490→            name: name.to_string(),
+   491→   491→            params,
+   492→   492→        });
+   493→   493→    }
+   494→   494→
+   495→   495→    // OpenAI function-call format: {"id": "...", "function": {"name": "...", "arguments": "..."}}
+   496→   496→    if let Some(func) = v.get("function") {
+   497→   497→        if let Some(fname) = func.get("name").and_then(|x| x.as_str()) {
+   498→   498→            let params = match func.get("arguments") {
+   499→   499→                // OpenAI ships arguments as a JSON *string* — parse it.
+   500→   500→                Some(Value::String(s)) => {
+   501→   501→                    serde_json::from_str(s).unwrap_or_else(|_| json!({}))
+   502→   502→                }
+   503→   503→                Some(other) if other.is_object() => other.clone(),
+   504→   504→                _ => json!({}),
+   505→   505→            };
+   506→   506→            return Some(ToolCall {
+   507→   507→                name: fname.to_string(),
+   508→   508→                params,
+   509→   509→            });
+   510→   510→        }
+   511→   511→    }
+   512→   512→
+   513→   513→    None
+   514→   514→}
+   515→   515→
+   516→   516→// ---------------------------------------------------------------------------
+   517→   517→// LLM call helper
+   518→   518→// ---------------------------------------------------------------------------
+   519→   519→
+   520→   520→/// Send the current message stream to the backend LLM and return the
+   521→   521→/// assistant's response text.
+   522→   522→///
+   523→   523→/// Uses the same `state.backend` and `state.client` as the rest of the
+   524→   524→/// engine, so all backend configuration (timeouts, retries, base URL)
+   525→   525→/// applies. On any failure (network error, non-2xx, empty body, malformed
+   526→   526→/// JSON), returns a `[aether-agent] …` diagnostic string so the agent
+   527→   527→/// loop can surface the problem and stop gracefully.
+   528→   528→async fn call_llm(state: &AppState, messages: &[AgentMessage]) -> String {
+   529→   529→    let request_body = json!({
+   530→   530→        "messages": messages.iter().map(AgentMessage::to_request_json).collect::<Vec<_>>(),
+   531→   531→        "temperature": 0.7,
+   532→   532→    });
+   533→   533→    let url = format!(
+   534→   534→        "{}/chat/completions",
+   535→   535→        state.backend.trim_end_matches('/')
+   536→   536→    );
+   537→   537→
+   538→   538→    match state.client.post(&url).json(&request_body).send().await {
+   539→   539→        Ok(resp) if resp.status().is_success() => {
+   540→   540→            let txt = resp.text().await.unwrap_or_default();
+   541→   541→            extract_assistant_content(&txt).unwrap_or_else(|| {
+   542→   542→                format!(
+   543→   543→                    "[aether-agent] empty backend response: {}",
+   544→   544→                    txt.chars().take(200).collect::<String>()
+   545→   545→                )
+   546→   546→            })
+   547→   547→        }
+   548→   548→        Ok(resp) => {
+   549→   549→            let status = resp.status();
+   550→   550→            let body_txt = resp.text().await.unwrap_or_default();
+   551→   551→            format!(
+   552→   552→                "[aether-agent] backend returned {status}: {}",
+   553→   553→                body_txt.chars().take(200).collect::<String>()
+   554→   554→            )
+   555→   555→        }
+   556→   556→        Err(e) => format!("[aether-agent] backend unreachable: {e}"),
+   557→   557→    }
+   558→   558→}
+   559→   559→
+   560→   560→/// Extract the assistant's text content from an OpenAI-shaped chat
+   561→   561→/// completion response body. Mirrors the same helper in `handlers.rs` but
+   562→   562→/// kept local to this module to avoid widening the visibility of the
+   563→   563→/// existing private function (which would break the "no signature changes"
+   564→   564→/// constraint).
+   565→   565→fn extract_assistant_content(body: &str) -> Option<String> {
+   566→   566→    let v: Value = serde_json::from_str(body).ok()?;
+   567→   567→    v.get("choices")
+   568→   568→        .and_then(|c| c.get(0))
+   569→   569→        .and_then(|c| c.get("message"))
+   570→   570→        .and_then(|m| m.get("content"))
+   571→   571→        .and_then(|c| c.as_str())
+   572→   572→        .map(|s| s.to_string())
+   573→   573→}
+   574→   574→
+   575→   575→// ---------------------------------------------------------------------------
+   576→   576→// The main agent loop
+   577→   577→// ---------------------------------------------------------------------------
+   578→   578→
+   579→   579→/// Run the autonomous agent loop until termination.
+   580→   580→///
+   581→   581→/// # Arguments
+   582→   582→///
+   583→   583→/// - `state` — the engine's shared [`AppState`] (used for the backend LLM
+   584→   584→///   call only; no other engine state is touched).
+   585→   585→/// - `goal` — the user's natural-language goal (e.g. *"set up a Python
+   586→   586→///   dev environment and write a hello-world script"*).
+   587→   587→/// - `context` — the current OS state as a JSON object (open windows,
+   588→   588→///   memory snapshot, active plan, goals, …). Pretty-printed into the
+   589→   589→///   system prompt so the LLM perceives it.
+   590→   590→/// - `max_iterations` — iteration cap. Clamped to `[1, ABSOLUTE_MAX_ITERATIONS]`.
+   591→   591→///
+   592→   592→/// # Returns
+   593→   593→///
+   594→   594→/// An [`AgentRunResult`] carrying the final assistant text, the iteration
+   595→   595→/// count, the full transcript of tool calls, and the `completed` flag.
+   596→   596→///
+   597→   597→/// # Termination
+   598→   598→///
+   599→   599→/// See the module docs. The loop stops on `TASK_COMPLETE`, on a
+   600→   600→/// no-tool-calls response, or on hitting `max_iterations`.
+   601→   601→///
+   602→   602→/// # Errors
+   603→   603→///
+   604→   604→/// This function never returns `Result::Err` — every failure path
+   605→   605→/// (backend unreachable, malformed response, unknown tool, invalid
+   606→   606→/// params, executor error) is converted into a diagnostic string and fed
+   607→   607→/// back into the message stream or surfaced in the final result. The
+   608→   608→/// caller decides how to react.
+   609→   609→pub async fn run_agent_loop(
+   610→   610→    state: AppState,
+   611→   611→    goal: &str,
+   612→   612→    context: &Value,
+   613→   613→    max_iterations: usize,
+   614→   614→) -> AgentRunResult {
+   615→   615→    // Clamp the iteration cap. We accept the caller's value but enforce a
+   616→   616→    // hard ceiling so a buggy caller can't pin a CPU forever against a
+   617→   617→    // broken backend.
+   618→   618→    let cap = max_iterations.clamp(1, ABSOLUTE_MAX_ITERATIONS);
+   619→   619→
+   620→   620→    // Build the tool registry + system prompt once; both are reused on
+   621→   621→    // every iteration.
+   622→   622→    let registry = ToolRegistry::new();
+   623→   623→    let catalog = registry.catalog();
+   624→   624→    let system_prompt = build_agent_system_prompt(&catalog, context);
+   625→   625→
+   626→   626→    // Initial state: [system, user(goal)].
+   627→   627→    let mut agent_state = AgentState {
+   628→   628→        iteration: 0,
+   629→   629→        messages: vec![
+   630→   630→            AgentMessage::system(system_prompt),
+   631→   631→            AgentMessage::user(goal.to_string()),
+   632→   632→        ],
+   633→   633→        tool_results: Vec::new(),
+   634→   634→        completed: false,
+   635→   635→    };
+   636→   636→
+   637→   637→    let mut all_tool_calls: Vec<ToolCall> = Vec::new();
+   638→   638→    let mut final_text = String::new();
+   639→   639→
+   640→   640→    for i in 0..cap {
+   641→   641→        agent_state.iteration = i + 1;
+   642→   642→
+   643→   643→        // ---- 2. Think: call the LLM with the current message stream ----
+   644→   644→        let response_text = call_llm(&state, &agent_state.messages).await;
+   645→   645→
+   646→   646→        // ---- 3a. Check for explicit completion sentinel ----
+   647→   647→        if response_text.contains(TASK_COMPLETE_SENTINEL) {
+   648→   648→            final_text = response_text;
+   649→   649→            agent_state.completed = true;
+   650→   650→            break;
+   651→   651→        }
+   652→   652→
+   653→   653→        // ---- 3b. Parse tool calls from the response ----
+   654→   654→        let calls = parse_tool_calls(&response_text);
+   655→   655→        all_tool_calls.extend(calls.clone());
+   656→   656→
+   657→   657→        // ---- 3c. No tool calls + no sentinel → stop (incomplete) ----
+   658→   658→        if calls.is_empty() {
+   659→   659→            final_text = response_text;
+   660→   660→            // `completed` stays false — the agent stopped without signaling.
+   661→   661→            break;
+   662→   662→        }
+   663→   663→
+   664→   664→        // Record the assistant message that contained the tool calls, so
+   665→   665→        // the next think step sees the full conversation context.
+   666→   666→        agent_state.messages.push(AgentMessage::assistant(response_text.clone()));
+   667→   667→
+   668→   668→        // ---- 4. Execute: dispatch each tool call through the registry ----
+   669→   669→        for call in &calls {
+   670→   670→            let (output, success) = match Tool::from_request(&call.name, &call.params) {
+   671→   671→                Some(tool) => registry.execute(&tool).await,
+   672→   672→                None => (
+   673→   673→                    format!(
+   674→   674→                        "tool_not_found: no tool named \"{}\" in registry. \
+   675→   675→                         Available tools: {}",
+   676→   676→                        call.name,
+   677→   677→                        catalog
+   678→   678→                            .iter()
+   679→   679→                            .map(|t| t.name)
+   680→   680→                            .collect::<Vec<_>>()
+   681→   681→                            .join(", ")
+   682→   682→                    ),
+   683→   683→                    false,
+   684→   684→                ),
+   685→   685→            };
+   686→   686→
+   687→   687→            let result = ToolResult {
+   688→   688→                tool: call.name.clone(),
+   689→   689→                output: output.clone(),
+   690→   690→                success,
+   691→   691→            };
+   692→   692→            agent_state.tool_results.push(result);
+   693→   693→
+   694→   694→            // ---- 5. Observe: feed the tool result back into the stream ----
+   695→   695→            agent_state
+   696→   696→                .messages
+   697→   697→                .push(AgentMessage::tool(call.name.clone(), output));
+   698→   698→        }
+   699→   699→
+   700→   700→        // The "final text" is the most recent assistant response, so if
+   701→   701→        // the next iteration hits the iteration cap we still return
+   702→   702→        // something useful.
+   703→   703→        final_text = response_text;
+   704→   704→
+   705→   705→        // ---- 6. Repeat (loop continues to the next think step) ----
+   706→   706→    }
+   707→   707→
+   708→   708→    AgentRunResult {
+   709→   709→        result: final_text,
+   710→   710→        iterations: agent_state.iteration,
+   711→   711→        tool_calls: all_tool_calls,
+   712→   712→        completed: agent_state.completed,
+   713→   713→    }
+   714→   714→}
+   715→   715→
+   716→   716→// ---------------------------------------------------------------------------
+   717→   717→// Tests (compile-only — no #[test] runner in this build)
+   718→   718→// ---------------------------------------------------------------------------
+   719→   719→
+   720→   720→#[cfg(test)]
+   721→   721→mod tests {
+   722→   722→    use super::*;
+   723→   723→
+   724→   724→    #[test]
+   725→   725→    fn parses_inline_json_tool_call() {
+   726→   726→        let resp = r#"I'll read the file. {"tool": "file_read", "params": {"path": "/etc/hostname"}} Done."#;
+   727→   727→        let calls = parse_tool_calls(resp);
+   728→   728→        assert_eq!(calls.len(), 1);
+   729→   729→        assert_eq!(calls[0].name, "file_read");
+   730→   730→        assert_eq!(calls[0].params["path"], "/etc/hostname");
+   731→   731→    }
+   732→   732→
+   733→   733→    #[test]
+   734→   734→    fn parses_fenced_code_block() {
+   735→   735→        let resp = "```json\n{\"tool\": \"exec\", \"params\": {\"command\": \"ls\"}}\n```";
+   736→   736→        let calls = parse_tool_calls(resp);
+   737→   737→        assert_eq!(calls.len(), 1);
+   738→   738→        assert_eq!(calls[0].name, "exec");
+   739→   739→    }
+   740→   740→
+   741→   741→    #[test]
+   742→   742→    fn parses_openai_function_call_format() {
+   743→   743→        let resp = r#"{"function": {"name": "memory_add", "arguments": "{\"text\": \"hi\", \"kind\": \"fact\"}"}}"#;
+   744→   744→        let calls = parse_tool_calls(resp);
+   745→   745→        assert_eq!(calls.len(), 1);
+   746→   746→        assert_eq!(calls[0].name, "memory_add");
+   747→   747→        assert_eq!(calls[0].params["text"], "hi");
+   748→   748→    }
+   749→   749→
+   750→   750→    #[test]
+   751→   751→    fn parses_tool_calls_wrapper() {
+   752→   752→        let resp = r#"{"tool_calls": [{"tool": "x", "params": {}}, {"tool": "y", "params": {}}]}"#;
+   753→   753→        let calls = parse_tool_calls(resp);
+   754→   754→        assert_eq!(calls.len(), 2);
+   755→   755→    }
+   756→   756→
+   757→   757→    #[test]
+   758→   758→    fn ignores_non_tool_json() {
+   759→   759→        let resp = r#"{"foo": "bar", "baz": [1, 2, 3]}"#;
+   760→   760→        let calls = parse_tool_calls(resp);
+   761→   761→        assert!(calls.is_empty());
+   762→   762→    }
+   763→   763→
+   764→   764→    #[test]
+   765→   765→    fn handles_braces_inside_strings() {
+   766→   766→        let resp = r#"{"tool": "exec", "params": {"command": "echo {hello}"}}"#;
+   767→   767→        let calls = parse_tool_calls(resp);
+   768→   768→        assert_eq!(calls.len(), 1);
+   769→   769→        assert_eq!(calls[0].params["command"], "echo {hello}");
+   770→   770→    }
+   771→   771→}
+   772→   772→

@@ -1,0 +1,91 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model MemoryNode {
+  id        String   @id @default(cuid())
+  text      String
+  category  String   @default("fact") // fact, lesson, plan, goal, intention, log, code
+  score     Float    @default(0.0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  edgesFrom MemoryEdge[] @relation("FromNode")
+  edgesTo   MemoryEdge[] @relation("ToNode")
+}
+
+model MemoryEdge {
+  id       String   @id @default(cuid())
+  fromId   String
+  toId     String
+  weight   Float    @default(0.5)
+  label    String   @default("related")
+
+  fromNode MemoryNode @relation("FromNode", fields: [fromId], references: [id], onDelete: Cascade)
+  toNode   MemoryNode @relation("ToNode", fields: [toId], references: [id], onDelete: Cascade)
+}
+
+model Conversation {
+  id        String    @id @default(cuid())
+  title     String    @default("New Conversation")
+  model     String    @default("aether-pipeline")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  role           String       // user, assistant, system, tool
+  content        String
+  pipelineStage  String?      // Which pipeline stage generated this
+  model          String?      // Which model generated this
+  tokens         Int          @default(0)
+  latencyMs      Int          @default(0)
+  createdAt      DateTime     @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+model DistillationPattern {
+  id          String   @id @default(cuid())
+  queryHash   String   @unique
+  queryText   String
+  pattern     String   // JSON stringified decomposition pattern
+  useCount    Int      @default(0)
+  successRate Float    @default(1.0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model PipelineStats {
+  id              String   @id @default(cuid())
+  totalRequests   Int      @default(0)
+  cacheHits       Int      @default(0)
+  simpleCount     Int      @default(0)
+  moderateCount   Int      @default(0)
+  complexCount    Int      @default(0)
+  atdPassRate     Float    @default(0.0)
+  avgLatencyMs    Int      @default(0)
+  distillationHits Int     @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model AgentRun {
+  id            String   @id @default(cuid())
+  goal          String
+  status        String   @default("running") // running, completed, failed
+  iterations    Int      @default(0)
+  maxIterations Int      @default(10)
+  toolCalls     String   @default("[]") // JSON
+  result        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}

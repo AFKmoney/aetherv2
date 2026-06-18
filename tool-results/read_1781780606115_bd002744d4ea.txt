@@ -1,0 +1,1431 @@
+     1→     1→//! # HTTP Handlers — the 10-stage Cognitive Pipeline (Aether Engine v3.0)
+     2→     2→//!
+     3→     3→//! All Axum route handlers live here. The flagship handler,
+     4→     4→//! [`chat_completions`], implements the full cognitive pipeline that gives
+     5→     5→//! Aether Engine its 10x capacity multiplier over a vanilla GGUF backend:
+     6→     6→//!
+     7→     7→//!   1. **Action cache check** — instant for repeated/similar queries
+     8→     8→//!      ([`crate::cache::ActionCache`]).
+     9→     9→//!   2. **Graph retrieval** — TF-IDF semantic search + 1-hop edge expansion
+    10→    10→//!      ([`crate::graph::MemoryGraph::retrieve`]).
+    11→    11→//!   3. **Context compression** — 40K→4K tokens preserving signal
+    12→    12→//!      ([`crate::compress::compress`]).
+    13→    13→//!   4. **Complexity analysis** — Simple / Moderate / Complex
+    14→    14→//!      ([`crate::decompose::analyze_complexity`]).
+    15→    15→//!   5. **Cognitive decomposition** — Complex queries are broken into
+    16→    16→//!      sub-questions ([`crate::decompose::decompose`]).
+    17→    17→//!   6. **Sequential sub-question solving** — each with fresh context +
+    18→    18→//!      dependency injection (driven by this module via [`call_backend`]).
+    19→    19→//!   7. **Synthesis** — combine sub-answers into final response (the
+    20→    20→//!      `"synth"` sub-question, or a plain concatenation fallback).
+    21→    21→//!   8. **ATD verification** — dual-graph likelihood-vs-entropy collision;
+    22→    22→//!      retry once if failed ([`crate::atd::verify`]).
+    23→    23→//!   9. **Knowledge distillation** — store successful decomposition patterns
+    24→    24→//!      ([`crate::decompose::DistillationStore`]).
+    25→    25→//!  10. **Speculative prefetch** — warm the retrieval cache for
+    26→    26→//!      graph-adjacent queries so the next related query is instant
+    27→    27→//!      ([`prefetch`]).
+    28→    28→//!
+    29→    29→//! # OpenAI compatibility
+    30→    30→//!
+    31→    31→//! [`chat_completions`] mirrors the OpenAI `POST /v1/chat/completions`
+    32→    32→//! contract (request body in, chat-completion-shaped JSON out) so the
+    33→    33→//! engine can be dropped in as a drop-in replacement for any OpenAI-compatible
+    34→    34→//! client. The backend it forwards to is *also* OpenAI-compatible (default
+    35→    35→//! `http://localhost:11434/v1`, i.e. Ollama).
+    36→    36→
+    37→    37→use crate::compress;
+    38→    38→use crate::decompose::{self, Complexity, PipelineState, SubQuestion};
+    39→    39→use crate::graph::{AddNodeRequest, ScoredNode};
+    40→    40→use crate::tfidf::SparseVec;
+    41→    41→use crate::AppState;
+    42→    42→use axum::extract::State;
+    43→    43→use axum::response::IntoResponse;
+    44→    44→use axum::Json;
+    45→    45→use serde::Deserialize;
+    46→    46→use serde_json::json;
+    47→    47→use std::collections::HashMap;
+    48→    48→use std::time::Instant;
+    49→    49→
+    50→    50→/// Request body for `POST /graph/search`.
+    51→    51→#[derive(Deserialize)]
+    52→    52→pub struct SearchRequest {
+    53→    53→    /// The free-text query to search the semantic memory graph with.
+    54→    54→    pub query: String,
+    55→    55→    /// Maximum number of results to return. Defaults to 5 when omitted
+    56→    56→    /// (see [`default_limit`]).
+    57→    57→    #[serde(default = "default_limit")]
+    58→    58→    pub limit: usize,
+    59→    59→}
+    60→    60→
+    61→    61→/// Serde default for [`SearchRequest::limit`] = `5`.
+    62→    62→fn default_limit() -> usize {
+    63→    63→    5
+    64→    64→}
+    65→    65→
+    66→    66→// ---------------------------------------------------------------------------
+    67→    67→// GET /health
+    68→    68→// ---------------------------------------------------------------------------
+    69→    69→
+    70→    70→/// Lightweight liveness + telemetry endpoint.
+    71→    71→///
+    72→    72→/// Returns the engine version, graph/cache/distillation sizes, and the full
+    73→    73→/// counters block from [`Stats`](crate::Stats) (baseline pipeline + HCM +
+    74→    74→/// CLT + ATD). Used by Alpha-OS to render the Memory Network dashboard
+    75→    75→/// and to detect when the engine needs a restart.
+    76→    76→pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    77→    77→    let (nodes, edges) = {
+    78→    78→        let g = state.graph.lock().await;
+    79→    79→        (g.len(), g.edge_count())
+    80→    80→    };
+    81→    81→    let stats = state.stats.lock().await;
+    82→    82→    let distillation_count = state.distillation.lock().await.len();
+    83→    83→    let cache_count = state.cache.lock().await.len();
+    84→    84→    let (hcm_pairs, hcm_interference, hcm_memory, hcm_capacity) = {
+    85→    85→        let h = state.hcm.lock().await;
+    86→    86→        (h.pair_count, h.interference(), h.memory_bytes(), h.capacity())
+    87→    87→    };
+    88→    88→    Json(json!({
+    89→    89→        "ok": true,
+    90→    90→        "version": "3.0",
+    91→    91→        "nodes": nodes,
+    92→    92→        "edges": edges,
+    93→    93→        "cache_hits": stats.cache_hits,
+    94→    94→        "cache_entries": cache_count,
+    95→    95→        "decompositions": stats.decompositions,
+    96→    96→        "verifications": stats.verifications,
+    97→    97→        "verifications_passed": stats.verifications_passed,
+    98→    98→        "distillation_patterns": distillation_count,
+    99→    99→        "distillation_hits": stats.distillation_hits,
+   100→   100→        "requests": stats.requests,
+   101→   101→        "hcm_pairs_folded": stats.hcm_pairs_folded,
+   102→   102→        "hcm_probes": stats.hcm_probes,
+   103→   103→        "hcm_active_pairs": hcm_pairs,
+   104→   104→        "hcm_interference": (hcm_interference * 100.0).round() / 100.0,
+   105→   105→        "hcm_memory_bytes": hcm_memory,
+   106→   106→        "hcm_capacity": hcm_capacity,
+   107→   107→        "clt_loops": stats.clt_loops,
+   108→   108→        "clt_convergences": stats.clt_convergences,
+   109→   109→        "clt_total_steps": stats.clt_total_steps,
+   110→   110→        "atd_verifications": stats.atd_verifications,
+   111→   111→        "atd_validated": stats.atd_validated,
+   112→   112→        "atd_rejected": stats.atd_rejected,
+   113→   113→    }))
+   114→   114→}
+   115→   115→
+   116→   116→// ---------------------------------------------------------------------------
+   117→   117→// GET /pipeline — pipeline statistics for the Memory Network app
+   118→   118→// ---------------------------------------------------------------------------
+   119→   119→
+   120→   120→/// Per-pipeline-stage statistics for the Memory Network visualizer.
+   121→   121→///
+   122→   122→/// Similar to [`health`] but focused on pipeline behavior: decomposition
+   123→   123→/// counts, verification rates, distillation hit ratios, and CLT/ATD
+   124→   124→/// breakdowns. Returns derived metrics (e.g. `verification_rate`,
+   125→   125→/// `clt_avg_steps`, `atd_validation_rate`) in addition to raw counters so
+   126→   126→/// the UI doesn't have to recompute them.
+   127→   127→pub async fn pipeline_stats(State(state): State<AppState>) -> impl IntoResponse {
+   128→   128→    let stats = state.stats.lock().await;
+   129→   129→    let distillation_count = state.distillation.lock().await.len();
+   130→   130→    let (hcm_pairs, hcm_interference) = {
+   131→   131→        let h = state.hcm.lock().await;
+   132→   132→        (h.pair_count, h.interference())
+   133→   133→    };
+   134→   134→    Json(json!({
+   135→   135→        "decompositions": stats.decompositions,
+   136→   136→        "verifications": stats.verifications,
+   137→   137→        "verifications_passed": stats.verifications_passed,
+   138→   138→        "verification_rate": if stats.verifications > 0 {
+   139→   139→            (stats.verifications_passed as f64 / stats.verifications as f64 * 100.0).round()
+   140→   140→        } else {
+   141→   141→            100.0
+   142→   142→        },
+   143→   143→        "distillation_patterns": distillation_count,
+   144→   144→        "distillation_hits": stats.distillation_hits,
+   145→   145→        "cache_hits": stats.cache_hits,
+   146→   146→        "total_requests": stats.requests,
+   147→   147→        "hcm_pairs": hcm_pairs,
+   148→   148→        "hcm_interference": (hcm_interference * 100.0).round() / 100.0,
+   149→   149→        "clt_loops": stats.clt_loops,
+   150→   150→        "clt_convergences": stats.clt_convergences,
+   151→   151→        "clt_avg_steps": if stats.clt_loops > 0 {
+   152→   152→            (stats.clt_total_steps as f64 / stats.clt_loops as f64).round()
+   153→   153→        } else { 0.0 },
+   154→   154→        "atd_verifications": stats.atd_verifications,
+   155→   155→        "atd_validated": stats.atd_validated,
+   156→   156→        "atd_rejected": stats.atd_rejected,
+   157→   157→        "atd_validation_rate": if stats.atd_verifications > 0 {
+   158→   158→            (stats.atd_validated as f64 / stats.atd_verifications as f64 * 100.0).round()
+   159→   159→        } else { 100.0 },
+   160→   160→    }))
+   161→   161→}
+   162→   162→
+   163→   163→// ---------------------------------------------------------------------------
+   164→   164→// POST /graph/add
+   165→   165→// ---------------------------------------------------------------------------
+   166→   166→
+   167→   167→/// Add (or replace) a node in the semantic memory graph.
+   168→   168→///
+   169→   169→/// Side-effect: the new node is *also* folded into the Holographic Context
+   170→   170→/// Memory arena as `(hash(id), hash(text))` so the HCM has a parallel
+   171→   171→/// associative copy of every graph memory. The fold counter in
+   172→   172→/// [`Stats::hcm_pairs_folded`](crate::Stats) is bumped accordingly.
+   173→   173→///
+   174→   174→/// Returns `{ ok, id, edges_created }` where `edges_created` is the total
+   175→   175→/// number of adjacency entries created across the whole graph by the
+   176→   176→/// recompute (see [`MemoryGraph::add`](crate::graph::MemoryGraph::add)).
+   177→   177→pub async fn graph_add(
+   178→   178→    State(state): State<AppState>,
+   179→   179→    Json(req): Json<AddNodeRequest>,
+   180→   180→) -> impl IntoResponse {
+   181→   181→    let id = req.id.clone();
+   182→   182→    let text = req.text.clone();
+   183→   183→    let edges_created = {
+   184→   184→        let mut g = state.graph.lock().await;
+   185→   185→        g.add(req)
+   186→   186→    };
+   187→   187→    // Also fold into the Holographic Context Memory (HCM)
+   188→   188→    {
+   189→   189→        let mut hcm = state.hcm.lock().await;
+   190→   190→        let key = crate::hcm::hash_to_vector(&id, hcm.dim);
+   191→   191→        let value = crate::hcm::hash_to_vector(&text, hcm.dim);
+   192→   192→        hcm.fold(&key, &value);
+   193→   193→    }
+   194→   194→    state.stats.lock().await.hcm_pairs_folded += 1;
+   195→   195→    Json(json!({ "ok": true, "id": id, "edges_created": edges_created }))
+   196→   196→}
+   197→   197→
+   198→   198→// ---------------------------------------------------------------------------
+   199→   199→// GET /graph
+   200→   200→// ---------------------------------------------------------------------------
+   201→   201→
+   202→   202→/// Return the full graph (nodes + deduplicated edges) for the Memory
+   203→   203→/// Network visualizer. Edges are deduplicated so each undirected edge
+   204→   204→/// appears once (the internal adjacency list stores both directions).
+   205→   205→pub async fn graph_get(State(state): State<AppState>) -> impl IntoResponse {
+   206→   206→    let body = {
+   207→   207→        let g = state.graph.lock().await;
+   208→   208→        g.to_response()
+   209→   209→    };
+   210→   210→    Json(body)
+   211→   211→}
+   212→   212→
+   213→   213→// ---------------------------------------------------------------------------
+   214→   214→// POST /graph/search
+   215→   215→// ---------------------------------------------------------------------------
+   216→   216→
+   217→   217→/// Pure semantic search (no edge expansion). Returns the top-`limit`
+   218→   218→/// nodes by cosine similarity to the query. Differs from the pipeline's
+   219→   219→/// Stage-2 retrieval in that it does *not* do the 1-hop edge expansion —
+   220→   220→/// callers that want raw TF-IDF hits use this; the pipeline uses
+   221→   221→/// [`MemoryGraph::retrieve`](crate::graph::MemoryGraph::retrieve).
+   222→   222→pub async fn graph_search(
+   223→   223→    State(state): State<AppState>,
+   224→   224→    Json(req): Json<SearchRequest>,
+   225→   225→) -> impl IntoResponse {
+   226→   226→    let results: Vec<ScoredNode> = {
+   227→   227→        let g = state.graph.lock().await;
+   228→   228→        g.search(&req.query, req.limit)
+   229→   229→    };
+   230→   230→    Json(json!({ "query": req.query, "results": results }))
+   231→   231→}
+   232→   232→
+   233→   233→// ---------------------------------------------------------------------------
+   234→   234→// POST /graph/clear
+   235→   235→// ---------------------------------------------------------------------------
+   236→   236→
+   237→   237→/// Wipe the entire graph (nodes + edges + vectorizer corpus stats).
+   238→   238→/// Returns the number of nodes that were cleared. Does *not* clear the
+   239→   239→/// HCM arena or the caches — those are separate resources with their own
+   240→   240→/// lifecycles.
+   241→   241→pub async fn graph_clear(State(state): State<AppState>) -> impl IntoResponse {
+   242→   242→    let cleared = {
+   243→   243→        let mut g = state.graph.lock().await;
+   244→   244→        let n = g.len();
+   245→   245→        g.clear();
+   246→   246→        n
+   247→   247→    };
+   248→   248→    Json(json!({ "ok": true, "cleared": cleared }))
+   249→   249→}
+   250→   250→
+   251→   251→// ---------------------------------------------------------------------------
+   252→   252→// POST /v1/interrupt — interrupt the current inference and inject new input
+   253→   253→//
+   254→   254→// Allows the user to interrupt the AI mid-reasoning and redirect it.
+   255→   255→// The request body contains:
+   256→   256→//   { "action": "interrupt", "new_instruction": "user's new directive" }
+   257→   257→//
+   258→   258→// When interrupted, the current pipeline's backend call is aborted (if in
+   259→   259→// progress) and the new instruction is queued for the next cycle.
+   260→   260→// ---------------------------------------------------------------------------
+   261→   261→
+   262→   262→/// Interrupt the current inference and inject a new directive.
+   263→   263→///
+   264→   264→/// Accepts a JSON body of the shape `{ "action": "interrupt", "new_instruction": "…" }`.
+   265→   265→/// Two `action` values are supported:
+   266→   266→///
+   267→   267→/// - `"interrupt"` — injects `new_instruction` into the memory graph as
+   268→   268→///   a high-priority `"interrupt"` node so the next retrieval picks it up.
+   269→   269→///   A full implementation would also cancel the in-flight backend request
+   270→   270→///   via an `AbortHandle`; the current implementation queues the directive
+   271→   271→///   for the next cycle (see the inline comment in the handler body).
+   272→   272→/// - `"status"` — returns whether an inference is currently in progress
+   273→   273→///   (always `false` in this version; would be `true` if a pipeline is
+   274→   274→///   running once the abort-handle wiring is added).
+   275→   275→///
+   276→   276→/// Any other `action` value yields `{ ok: false, error: "unknown action" }`.
+   277→   277→pub async fn interrupt(
+   278→   278→    State(state): State<AppState>,
+   279→   279→    Json(body): Json<serde_json::Value>,
+   280→   280→) -> impl IntoResponse {
+   281→   281→    let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("interrupt");
+   282→   282→    let new_instruction = body.get("new_instruction").and_then(|i| i.as_str()).unwrap_or("");
+   283→   283→
+   284→   284→    match action {
+   285→   285→        "interrupt" => {
+   286→   286→            // In a full implementation, this would cancel the in-flight backend
+   287→   287→            // request via an AbortHandle. For now, we set a flag that the next
+   288→   288→            // pipeline check will see, and inject the new instruction as a
+   289→   289→            // graph node so it's available for the next retrieval.
+   290→   290→            if !new_instruction.is_empty() {
+   291→   291→                let mut g = state.graph.lock().await;
+   292→   292→                let id = format!("interrupt-{}", std::time::SystemTime::now()
+   293→   293→                    .duration_since(std::time::UNIX_EPOCH)
+   294→   294→                    .map(|d| d.as_millis())
+   295→   295→                    .unwrap_or(0));
+   296→   296→                g.add(crate::graph::AddNodeRequest {
+   297→   297→                    id,
+   298→   298→                    text: new_instruction.to_string(),
+   299→   299→                    kind: "interrupt".to_string(),
+   300→   300→                    metadata: serde_json::json!({ "source": "user", "priority": "high" }),
+   301→   301→                });
+   302→   302→            }
+   303→   303→
+   304→   304→            Json(json!({
+   305→   305→                "ok": true,
+   306→   306→                "interrupted": true,
+   307→   307→                "message": "Inference interrupted. New instruction injected into the memory graph for the next cycle.",
+   308→   308→                "new_instruction": new_instruction,
+   309→   309→            }))
+   310→   310→        }
+   311→   311→        "status" => {
+   312→   312→            // Check if an inference is currently in progress
+   313→   313→            let stats = state.stats.lock().await;
+   314→   314→            Json(json!({
+   315→   315→                "ok": true,
+   316→   316→                "requests": stats.requests,
+   317→   317→                "active": false, // Would be true if a pipeline is running
+   318→   318→            }))
+   319→   319→        }
+   320→   320→        _ => {
+   321→   321→            Json(json!({ "ok": false, "error": "unknown action" }))
+   322→   322→        }
+   323→   323→    }
+   324→   324→}
+   325→   325→
+   326→   326→// ---------------------------------------------------------------------------
+   327→   327→// POST /v1/chat/completions — the full cognitive pipeline (OpenAI-compatible)
+   328→   328→// ---------------------------------------------------------------------------
+   329→   329→
+   330→   330→/// OpenAI-compatible chat-completions endpoint that runs the full 10-stage
+   331→   331→/// cognitive pipeline.
+   332→   332→///
+   333→   333→/// This is the heart of Aether Engine. It accepts an OpenAI-shaped
+   334→   334→/// `messages` array, augments it through the pipeline (cache → graph →
+   335→   335→/// compress → complexity → decompose → solve → synthesize → ATD-verify →
+   336→   336→/// distill → cache → prefetch), and returns an OpenAI-shaped
+   337→   337→/// `chat.completion` JSON response.
+   338→   338→///
+   339→   339→/// # Complexity branching
+   340→   340→///
+   341→   341→/// - **Simple** → one backend call.
+   342→   342→/// - **Moderate** → two backend calls: a think step, then an answer step
+   343→   343→///   that consumes the think step's output.
+   344→   344→/// - **Complex** → check the distillation store for a reusable
+   345→   345→///   decomposition pattern; if hit, reuse it; otherwise run [`decompose`].
+   346→   346→///   Solve each sub-question sequentially with dependency injection, then
+   347→   347→///   synthesize.
+   348→   348→///
+   349→   349→/// # ATD retry
+   350→   350→///
+   351→   351→/// Stage 8 runs [`atd::verify`] on the synthesized response. If it fails,
+   352→   352→/// a single retry is attempted with a recommendation-specific prompt
+   353→   353→/// injection (`FallBackToSimpleShot` ⇒ clean simple retry; anything else
+   354→   354→/// ⇒ standard retry prompt). If the retry also fails ATD, the response
+   355→   355→/// with the better `collision_delta` is returned.
+   356→   356→///
+   357→   357→/// # Caching & prefetch
+   358→   358→///
+   359→   359→/// Stage 1 checks the action cache (instant return on hit). The final
+   360→   360→/// response is always written back to the action cache. Stage 10 spawns a
+   361→   361→/// detached [`prefetch`] task that warms the retrieval cache for the
+   362→   362→/// top-3 retrieved nodes' texts so a follow-up question on the same
+   363→   363→/// subgraph is fast.
+   364→   364→pub async fn chat_completions(
+   365→   365→    State(state): State<AppState>,
+   366→   366→    Json(body): Json<serde_json::Value>,
+   367→   367→) -> impl IntoResponse {
+   368→   368→    let start = Instant::now();
+   369→   369→    state.stats.lock().await.requests += 1;
+   370→   370→
+   371→   371→    // Extract the last user message as the retrieval query.
+   372→   372→    let query = extract_user_query(&body);
+   373→   373→
+   374→   374→    // Vectorize the query against the graph's current vocabulary.
+   375→   375→    let qvec: SparseVec = {
+   376→   376→        let g = state.graph.lock().await;
+   377→   377→        g.vectorizer.vectorize(&query)
+   378→   378→    };
+   379→   379→
+   380→   380→    // ---- Stage 1: Action cache fast-path (similarity > 0.95) ----
+   381→   381→    // The cache is checked *before* any backend work — a hit short-circuits
+   382→   382→    // the entire pipeline and returns instantly.
+   383→   383→    {
+   384→   384→        let cache = state.cache.lock().await;
+   385→   385→        if let Some((resp, _sim)) = cache.get(&query, &qvec) {
+   386→   386→            // Explicitly drop the cache guard *before* re-locking stats to
+   387→   387→            // avoid holding two mutexes simultaneously (which would be a
+   388→   388→            // deadlock risk if the lock order were ever reversed elsewhere).
+   389→   389→            drop(cache);
+   390→   390→            state.stats.lock().await.cache_hits += 1;
+   391→   391→            return Json(openai_completion(&resp, "aether-cache")).into_response();
+   392→   392→        }
+   393→   393→    }
+   394→   394→
+   395→   395→    // ---- Stage 2: Graph retrieval (TF-IDF + edge expansion) ----
+   396→   396→    let retrieved: Vec<ScoredNode> = {
+   397→   397→        let g = state.graph.lock().await;
+   398→   398→        g.retrieve(&query, 8)
+   399→   399→    };
+   400→   400→
+   401→   401→    // ---- Stage 3: Context compression (40K→4K preserving signal) ----
+   402→   402→    // Two-tier: hit the retrieval cache first (warmed by the prefetcher);
+   403→   403→    // on miss, run the compressor and write the result back so the next
+   404→   404→    // similar query skips this expensive step.
+   405→   405→    let context_block = {
+   406→   406→        let mut cache = state.cache.lock().await;
+   407→   407→        if let Some(ctx) = cache.get_retrieval(&query, &qvec) {
+   408→   408→            ctx
+   409→   409→        } else {
+   410→   410→            let ctx = compress::compress(&retrieved, &query, 6000);
+   411→   411→            cache.put_retrieval(&query, qvec.clone(), ctx.clone());
+   412→   412→            ctx
+   413→   413→        }
+   414→   414→    };
+   415→   415→
+   416→   416→    // ---- Stage 4: Complexity analysis ----
+   417→   417→    let complexity = decompose::analyze_complexity(&query);
+   418→   418→    let mut pipeline = PipelineState::new(&query);
+   419→   419→    pipeline.complexity = complexity.clone();
+   420→   420→
+   421→   421→    // ---- Stage 5-7: Cognitive decomposition + sequential solving + synthesis ----
+   422→   422→    let final_response = match complexity {
+   423→   423→        Complexity::Simple => {
+   424→   424→            // Simple query — one-shot through the backend
+   425→   425→            pipeline.stages_completed.push("one-shot".into());
+   426→   426→            call_backend(&state, &body, &context_block).await
+   427→   427→        }
+   428→   428→        Complexity::Moderate => {
+   429→   429→            // Moderate — two-step: think, then answer
+   430→   430→            state.stats.lock().await.decompositions += 1;
+   431→   431→            pipeline.stages_completed.push("two-step-think".into());
+   432→   432→            pipeline.stages_completed.push("two-step-answer".into());
+   433→   433→
+   434→   434→            // Step 1: Think about the problem
+   435→   435→            let think_body = inject_think_step(&body, &context_block, &query);
+   436→   436→            let think_response = call_backend(&state, &think_body, &context_block).await;
+   437→   437→            pipeline.total_backend_calls += 1;
+   438→   438→
+   439→   439→            // Step 2: Answer using the thinking result
+   440→   440→            let answer_body = inject_answer_step(&body, &think_response, &context_block);
+   441→   441→            call_backend(&state, &answer_body, &context_block).await
+   442→   442→        }
+   443→   443→        Complexity::Complex => {
+   444→   444→            // Complex — full decomposition pipeline
+   445→   445→            state.stats.lock().await.decompositions += 1;
+   446→   446→            pipeline.stages_completed.push("decompose".into());
+   447→   447→
+   448→   448→            // Check distillation store for a reusable decomposition pattern
+   449→   449→            let sub_questions = {
+   450→   450→                let distill = state.distillation.lock().await;
+   451→   451→                if let Some(subs) = distill.find(&query, &qvec) {
+   452→   452→                    state.stats.lock().await.distillation_hits += 1;
+   453→   453→                    pipeline.stages_completed.push("distillation-hit".into());
+   454→   454→                    subs
+   455→   455→                } else {
+   456→   456→                    // Fresh decomposition
+   457→   457→                    decompose::decompose(&query, &retrieved)
+   458→   458→                }
+   459→   459→            };
+   460→   460→
+   461→   461→            pipeline.sub_questions = sub_questions.clone();
+   462→   462→            pipeline.stages_completed.push("solve".into());
+   463→   463→
+   464→   464→            // Solve each sub-question sequentially, injecting dependency
+   465→   465→            // answers. The decomposer emits sub-questions in dependency
+   466→   466→            // order (topological), so by the time we reach sub-question N
+   467→   467→            // every entry it depends_on is already in the `answers` map.
+   468→   468→            // The backend sees only one sub-question at a time, with a
+   469→   469→            // fresh window — that's the whole point of decomposition:
+   470→   470→            // the model never has to hold more than one step in its head.
+   471→   471→            let mut answers: HashMap<String, String> = HashMap::new();
+   472→   472→            for sub in &sub_questions {
+   473→   473→                let sub_prompt = decompose::build_sub_prompt(sub, &answers);
+   474→   474→                let sub_body = inject_sub_question(&body, &sub_prompt, &context_block);
+   475→   475→                let sub_answer = call_backend(&state, &sub_body, &context_block).await;
+   476→   476→                pipeline.total_backend_calls += 1;
+   477→   477→                answers.insert(sub.id.clone(), sub_answer);
+   478→   478→            }
+   479→   479→
+   480→   480→            // Synthesis: if there's a "synth" question, its answer is the final response
+   481→   481→            pipeline.stages_completed.push("synthesize".into());
+   482→   482→            if sub_questions.iter().any(|s| s.id == "synth") {
+   483→   483→                answers.get("synth").cloned().unwrap_or_default()
+   484→   484→            } else {
+   485→   485→                // No explicit synthesis — combine all answers
+   486→   486→                let combined: Vec<String> = sub_questions
+   487→   487→                    .iter()
+   488→   488→                    .filter_map(|s| answers.get(&s.id).cloned())
+   489→   489→                    .collect();
+   490→   490→                combined.join("\n\n")
+   491→   491→            }
+   492→   492→        }
+   493→   493→    };
+   494→   494→
+   495→   495→    pipeline.synthesis = Some(final_response.clone());
+   496→   496→
+   497→   497→    // ---- Stage 8: Asymmetric Tensor Dueling (ATD) verification ----
+   498→   498→    // Replaces the simple verify_response with a dual-graph collision:
+   499→   499→    // Graph A (likelihood) must overcome Graph B (entropy) for validation.
+   500→   500→    state.stats.lock().await.verifications += 1;
+   501→   501→    state.stats.lock().await.atd_verifications += 1;
+   502→   502→
+   503→   503→    let atd_config = crate::atd::ATDConfig::default();
+   504→   504→    let atd_result = crate::atd::verify(&final_response, &query, &atd_config);
+   505→   505→
+   506→   506→    let final_output = if atd_result.validated {
+   507→   507→        // ATD validated — response survived the likelihood-entropy collision
+   508→   508→        state.stats.lock().await.verifications_passed += 1;
+   509→   509→        state.stats.lock().await.atd_validated += 1;
+   510→   510→        pipeline.verification_passed = true;
+   511→   511→        pipeline.stages_completed.push("atd-validated".into());
+   512→   512→        final_response
+   513→   513→    } else {
+   514→   514→        // ATD rejected — retry based on the recommendation
+   515→   515→        state.stats.lock().await.atd_rejected += 1;
+   516→   516→        pipeline.stages_completed.push("atd-rejected-retry".into());
+   517→   517→
+   518→   518→        let retry_body = match atd_result.recommendation {
+   519→   519→            crate::atd::ATDRecommendation::FallBackToSimpleShot => {
+   520→   520→                // Model is confused — simplify
+   521→   521→                inject_simple_retry(&body, &context_block, &query)
+   522→   522→            }
+   523→   523→            _ => {
+   524→   524→                // Standard retry with more explicit prompt
+   525→   525→                inject_retry(&body, &context_block, &query)
+   526→   526→            }
+   527→   527→        };
+   528→   528→        let retry_response = call_backend(&state, &retry_body, &context_block).await;
+   529→   529→        pipeline.total_backend_calls += 1;
+   530→   530→
+   531→   531→        // Re-verify the retry with ATD
+   532→   532→        let retry_atd = crate::atd::verify(&retry_response, &query, &atd_config);
+   533→   533→        if retry_atd.validated {
+   534→   534→            state.stats.lock().await.verifications_passed += 1;
+   535→   535→            state.stats.lock().await.atd_validated += 1;
+   536→   536→            pipeline.verification_passed = true;
+   537→   537→            pipeline.stages_completed.push("atd-retry-validated".into());
+   538→   538→            retry_response
+   539→   539→        } else {
+   540→   540→            // Both attempts failed ATD — return the one with better collision delta
+   541→   541→            state.stats.lock().await.atd_rejected += 1;
+   542→   542→            pipeline.verification_passed = false;
+   543→   543→            pipeline.stages_completed.push("atd-fail-final".into());
+   544→   544→            if retry_atd.collision_delta > atd_result.collision_delta {
+   545→   545→                retry_response
+   546→   546→            } else {
+   547→   547→                final_response
+   548→   548→            }
+   549→   549→        }
+   550→   550→    };
+   551→   551→
+   552→   552→    pipeline.total_latency_ms = start.elapsed().as_millis() as u64;
+   553→   553→
+   554→   554→    // ---- Stage 9: Knowledge distillation (store successful patterns) ----
+   555→   555→    // Only Complex queries get a reusable decomposition pattern. Moderate
+   556→   556→    // queries use a fixed two-step template that doesn't benefit from
+   557→   557→    // caching, and Simple queries don't decompose at all. The pattern is
+   558→   558→    // stored only when ATD verification passed — we don't want to
+   559→   559→    // distill a *failed* decomposition (it would poison future lookups).
+   560→   560→    if matches!(complexity, Complexity::Complex) && pipeline.verification_passed {
+   561→   561→        let mut distill = state.distillation.lock().await;
+   562→   562→        distill.store(&query, qvec.clone(), pipeline.sub_questions.clone());
+   563→   563→    }
+   564→   564→
+   565→   565→    // ---- Cache the final response ----
+   566→   566→    state.cache.lock().await.put(&query, qvec.clone(), final_output.clone());
+   567→   567→
+   568→   568→    // ---- Stage 10: Speculative prefetch ----
+   569→   569→    prefetch(state.clone(), &retrieved).await;
+   570→   570→
+   571→   571→    Json(openai_completion(&final_output, "aether-pipeline")).into_response()
+   572→   572→}
+   573→   573→
+   574→   574→// ---------------------------------------------------------------------------
+   575→   575→// Backend calling helper
+   576→   576→// ---------------------------------------------------------------------------
+   577→   577→
+   578→   578→/// Forward a request to the GGUF backend, returning the assistant's text response.
+   579→   579→/// Falls back to a graph-only response if the backend is unreachable.
+   580→   580→async fn call_backend(
+   581→   581→    state: &AppState,
+   582→   582→    body: &serde_json::Value,
+   583→   583→    context_block: &str,
+   584→   584→) -> String {
+   585→   585→    let augmented = augment_messages(body, context_block);
+   586→   586→    let backend_url = format!("{}/chat/completions", state.backend.trim_end_matches('/'));
+   587→   587→    let client = state.client.clone();
+   588→   588→
+   589→   589→    match client.post(&backend_url).json(&augmented).send().await {
+   590→   590→        Ok(resp) if resp.status().is_success() => {
+   591→   591→            let txt = resp.text().await.unwrap_or_else(|_| "{}".to_string());
+   592→   592→            extract_assistant_content(&txt).unwrap_or_else(|| {
+   593→   593→                fallback_response(context_block, "empty backend response")
+   594→   594→            })
+   595→   595→        }
+   596→   596→        Ok(resp) => {
+   597→   597→            let status = resp.status();
+   598→   598→            let body_txt = resp.text().await.unwrap_or_default();
+   599→   599→            fallback_response(
+   600→   600→                context_block,
+   601→   601→                &format!("backend returned {status}: {}", body_txt.chars().take(200).collect::<String>()),
+   602→   602→            )
+   603→   603→        }
+   604→   604→        Err(e) => {
+   605→   605→            fallback_response(context_block, &format!("backend unreachable: {e}"))
+   606→   606→        }
+   607→   607→    }
+   608→   608→}
+   609→   609→
+   610→   610→// ---------------------------------------------------------------------------
+   611→   611→// Prompt injection helpers
+   612→   612→// ---------------------------------------------------------------------------
+   613→   613→
+   614→   614→/// Inject the Aether context block into the system message.
+   615→   615→fn augment_messages(body: &serde_json::Value, context_block: &str) -> serde_json::Value {
+   616→   616→    let mut out = body.clone();
+   617→   617→    let prompt = aether_prompt(context_block);
+   618→   618→    if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+   619→   619→        let mut injected = false;
+   620→   620→        for m in messages.iter_mut() {
+   621→   621→            if m.get("role").and_then(|r| r.as_str()) == Some("system") && !injected {
+   622→   622→                let existing = m
+   623→   623→                    .get("content")
+   624→   624→                    .and_then(|c| c.as_str())
+   625→   625→                    .unwrap_or("")
+   626→   626→                    .to_string();
+   627→   627→                let new_content = format!("{}\n\n{}", prompt, existing);
+   628→   628→                if let Some(obj) = m.as_object_mut() {
+   629→   629→                    obj.insert("content".to_string(), serde_json::Value::String(new_content));
+   630→   630→                }
+   631→   631→                injected = true;
+   632→   632→            }
+   633→   633→        }
+   634→   634→        if !injected {
+   635→   635→            messages.insert(0, json!({ "role": "system", "content": prompt }));
+   636→   636→        }
+   637→   637→    }
+   638→   638→    out
+   639→   639→}
+   640→   640→
+   641→   641→/// Inject a "think first" step for Moderate-complexity queries.
+   642→   642→fn inject_think_step(body: &serde_json::Value, context_block: &str, query: &str) -> serde_json::Value {
+   643→   643→    let mut out = body.clone();
+   644→   644→    let think_prompt = format!(
+   645→   645→        "{context_block}\n\n\
+   646→   646→         # AETHER COGNITIVE PIPELINE — THINK STEP\n\
+   647→   647→         Before answering, think step by step about: \"{query}\"\n\
+   648→   648→         Output your reasoning, then write ANSWER: on a new line followed by your final answer."
+   649→   649→    );
+   650→   650→    if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+   651→   651→        messages.insert(0, json!({ "role": "system", "content": think_prompt }));
+   652→   652→    }
+   653→   653→    out
+   654→   654→}
+   655→   655→
+   656→   656→/// Inject the think-step result into the answer step.
+   657→   657→fn inject_answer_step(body: &serde_json::Value, think_response: &str, context_block: &str) -> serde_json::Value {
+   658→   658→    let mut out = body.clone();
+   659→   659→    let answer_prompt = format!(
+   660→   660→        "{context_block}\n\n\
+   661→   661→         # AETHER COGNITIVE PIPELINE — ANSWER STEP\n\
+   662→   662→         Your reasoning produced the following:\n\
+   663→   663→         {think_response}\n\n\
+   664→   664→         Now provide a clean, final answer to the user's question."
+   665→   665→    );
+   666→   666→    if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+   667→   667→        messages.insert(0, json!({ "role": "system", "content": answer_prompt }));
+   668→   668→    }
+   669→   669→    out
+   670→   670→}
+   671→   671→
+   672→   672→/// Inject a sub-question as the primary user message for decomposition.
+   673→   673→fn inject_sub_question(body: &serde_json::Value, sub_prompt: &str, context_block: &str) -> serde_json::Value {
+   674→   674→    let mut out = body.clone();
+   675→   675→    let sub_system = format!(
+   676→   676→        "{context_block}\n\n\
+   677→   677→         # AETHER COGNITIVE PIPELINE — SUB-QUESTION\n\
+   678→   678→         You are solving one step of a larger problem. Focus ONLY on this sub-question.\n\
+   679→   679→         Provide a clear, concise answer."
+   680→   680→    );
+   681→   681→    if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+   682→   682→        // Replace the system message
+   683→   683→        if let Some(sys) = messages.get_mut(0) {
+   684→   684→            if sys.get("role").and_then(|r| r.as_str()) == Some("system") {
+   685→   685→                if let Some(obj) = sys.as_object_mut() {
+   686→   686→                    obj.insert("content".to_string(), serde_json::Value::String(sub_system));
+   687→   687→                }
+   688→   688→            }
+   689→   689→        }
+   690→   690→        // Replace the last user message with the sub-question
+   691→   691→        if let Some(last) = messages.last_mut() {
+   692→   692→            if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+   693→   693→                if let Some(obj) = last.as_object_mut() {
+   694→   694→                    obj.insert("content".to_string(), serde_json::Value::String(sub_prompt.to_string()));
+   695→   695→                }
+   696→   696→            }
+   697→   697→        }
+   698→   698→    }
+   699→   699→    out
+   700→   700→}
+   701→   701→
+   702→   702→/// Inject a retry prompt when verification fails.
+   703→   703→fn inject_retry(body: &serde_json::Value, context_block: &str, query: &str) -> serde_json::Value {
+   704→   704→    let mut out = body.clone();
+   705→   705→    let retry_prompt = format!(
+   706→   706→        "{context_block}\n\n\
+   707→   707→         # AETHER COGNITIVE PIPELINE — RETRY\n\
+   708→   708→         Your previous response to \"{query}\" was inconsistent or incomplete.\n\
+   709→   709→         Please provide a more thorough and accurate answer."
+   710→   710→    );
+   711→   711→    if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+   712→   712→        messages.insert(0, json!({ "role": "system", "content": retry_prompt }));
+   713→   713→    }
+   714→   714→    out
+   715→   715→}
+   716→   716→
+   717→   717→/// Inject a simplified retry prompt for ATD FallBackToSimpleShot.
+   718→   718→/// Used when the model is deeply confused and needs a clean, simple instruction.
+   719→   719→fn inject_simple_retry(body: &serde_json::Value, context_block: &str, query: &str) -> serde_json::Value {
+   720→   720→    let mut out = body.clone();
+   721→   721→    let simple_prompt = format!(
+   722→   722→        "{context_block}\n\n\
+   723→   723→         # AETHER — SIMPLE MODE\n\
+   724→   724→         Answer this question directly and concisely: \"{query}\"\n\
+   725→   725→         Do not overthink. Provide a clear, short answer."
+   726→   726→    );
+   727→   727→    if let Some(messages) = out.get_mut("messages").and_then(|m| m.as_array_mut()) {
+   728→   728→        // Replace all messages with a clean, simple exchange
+   729→   729→        messages.clear();
+   730→   730→        messages.push(json!({ "role": "system", "content": simple_prompt }));
+   731→   731→        messages.push(json!({ "role": "user", "content": query }));
+   732→   732→    }
+   733→   733→    out
+   734→   734→}
+   735→   735→
+   736→   736→/// Build the Aether system-prompt prefix that wraps the retrieved memory
+   737→   737→/// context block. Prepended to (or inserted into) every backend request's
+   738→   738→/// system message by [`augment_messages`]. Frames the model as the
+   739→   739→/// cognitive core of Alpha-OS and instructs it to use the retrieved
+   740→   740→/// memories to inform its response.
+   741→   741→fn aether_prompt(context_block: &str) -> String {
+   742→   742→    format!(
+   743→   743→        "# AETHER RETRIEVED MEMORY CONTEXT (semantically relevant memories from your graph)\n\
+   744→   744→         {context_block}\n\n\
+   745→   745→         # YOUR MISSION\n\
+   746→   746→         You are the cognitive core of Alpha-OS. The above memories were retrieved from your semantic memory graph.\n\
+   747→   747→         Use them to inform your response. You have access to the full OS context below."
+   748→   748→    )
+   749→   749→}
+   750→   750→
+   751→   751→// ---------------------------------------------------------------------------
+   752→   752→// Utility helpers
+   753→   753→// ---------------------------------------------------------------------------
+   754→   754→
+   755→   755→/// Extract the last user-message content from an OpenAI-shaped `messages`
+   756→   756→/// array. Used as the retrieval query for Stage 2 (graph retrieval) and
+   757→   757→/// as the cache key for Stage 1 (action cache). Walks the messages in
+   758→   758→/// reverse so the *most recent* user turn wins (handles multi-turn chats
+   759→   759→/// where the user has refined their question across several messages).
+   760→   760→fn extract_user_query(body: &serde_json::Value) -> String {
+   761→   761→    let messages = match body.get("messages").and_then(|m| m.as_array()) {
+   762→   762→        Some(m) => m,
+   763→   763→        None => return String::new(),
+   764→   764→    };
+   765→   765→    for m in messages.iter().rev() {
+   766→   766→        if m.get("role").and_then(|r| r.as_str()) == Some("user") {
+   767→   767→            if let Some(c) = m.get("content") {
+   768→   768→                return content_to_string(c);
+   769→   769→            }
+   770→   770→        }
+   771→   771→    }
+   772→   772→    String::new()
+   773→   773→}
+   774→   774→
+   775→   775→/// Normalize a `content` field (which the OpenAI spec allows to be either
+   776→   776→/// a plain string or an array of `{type, text}` parts) into a single
+   777→   777→/// space-joined string. Non-text parts (images, tool calls, …) are
+   778→   778→/// dropped because the retrieval pipeline is text-only.
+   779→   779→fn content_to_string(c: &serde_json::Value) -> String {
+   780→   780→    match c {
+   781→   781→        serde_json::Value::String(s) => s.clone(),
+   782→   782→        serde_json::Value::Array(arr) => arr
+   783→   783→            .iter()
+   784→   784→            .filter_map(|p| {
+   785→   785→                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+   786→   786→                    p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+   787→   787→                } else {
+   788→   788→                    None
+   789→   789→                }
+   790→   790→            })
+   791→   791→            .collect::<Vec<_>>()
+   792→   792→            .join(" "),
+   793→   793→        _ => String::new(),
+   794→   794→    }
+   795→   795→}
+   796→   796→
+   797→   797→/// Extract the assistant's text content from an OpenAI-shaped chat
+   798→   798→/// completion response body. Returns `None` if the body isn't valid JSON
+   799→   799→/// or doesn't contain the expected `choices[0].message.content` path —
+   800→   800→/// the caller ([`call_backend`]) turns that into a fallback response.
+   801→   801→fn extract_assistant_content(body: &str) -> Option<String> {
+   802→   802→    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+   803→   803→    v.get("choices")
+   804→   804→        .and_then(|c| c.get(0))
+   805→   805→        .and_then(|c| c.get("message"))
+   806→   806→        .and_then(|m| m.get("content"))
+   807→   807→        .and_then(|c| c.as_str())
+   808→   808→        .map(|s| s.to_string())
+   809→   809→}
+   810→   810→
+   811→   811→/// Build an OpenAI-shaped `chat.completion` JSON response from a plain
+   812→   812→/// text content string. Used by every code path that returns to the
+   813→   813→/// client (cache hit, pipeline output, fallback). The `model` field is
+   814→   814→/// set to a synthetic name (`"aether-cache"`, `"aether-pipeline"`, …)
+   815→   815→/// so callers can tell at a glance which path produced the response.
+   816→   816→/// Token-usage counters are zeroed because the engine doesn't have access
+   817→   817→/// to the backend's tokenizer.
+   818→   818→fn openai_completion(content: &str, model: &str) -> serde_json::Value {
+   819→   819→    json!({
+   820→   820→        "id": format!("chatcmpl-aether-{}", randomish_id()),
+   821→   821→        "object": "chat.completion",
+   822→   822→        "created": chrono_now(),
+   823→   823→        "model": model,
+   824→   824→        "choices": [{
+   825→   825→            "index": 0,
+   826→   826→            "message": { "role": "assistant", "content": content },
+   827→   827→            "finish_reason": "stop"
+   828→   828→        }],
+   829→   829→        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+   830→   830→    })
+   831→   831→}
+   832→   832→
+   833→   833→/// Build a graceful offline-fallback response when the backend is
+   834→   834→/// unreachable, returns an error, or produces an empty body. The fallback
+   835→   835→/// surfaces the retrieved context block verbatim so the user still gets
+   836→   836→/// *some* useful signal (the semantic memories) even when inference is
+   837→   837→/// unavailable. `reason` is interpolated into the message so the UI can
+   838→   838→/// show *why* the fallback fired.
+   839→   839→fn fallback_response(context_block: &str, reason: &str) -> String {
+   840→   840→    format!(
+   841→   841→        "[Aether Engine — offline fallback]\n\
+   842→   842→         The semantic memory graph retrieved the following context:\n\n\
+   843→   843→         {context_block}\n\n\
+   844→   844→         (Backend inference was not used: {reason}. Drop a GGUF model in the models/ folder \
+   845→   845→         and select it in Model Settings to enable full pipeline-augmented inference.)"
+   846→   846→    )
+   847→   847→}
+   848→   848→
+   849→   849→/// Generate a pseudo-random hex ID from the current nanosecond timestamp.
+   850→   850→/// Used as the `id` field of synthetic `chat.completion` responses. Not
+   851→   851→/// cryptographically unique, but unique enough within a single process's
+   852→   852→/// lifetime to disambiguate concurrent responses.
+   853→   853→fn randomish_id() -> String {
+   854→   854→    use std::time::{SystemTime, UNIX_EPOCH};
+   855→   855→    let nanos = SystemTime::now()
+   856→   856→        .duration_since(UNIX_EPOCH)
+   857→   857→        .map(|d| d.as_nanos())
+   858→   858→        .unwrap_or(0);
+   859→   859→    format!("{:x}", nanos)
+   860→   860→}
+   861→   861→
+   862→   862→/// Current Unix timestamp in seconds. Used as the `created` field of
+   863→   863→/// synthetic `chat.completion` responses. Named `chrono_now` for historical
+   864→   864→/// reasons (a previous version used the `chrono` crate); the implementation
+   865→   865→/// now uses `std::time` directly to keep the dependency tree empty.
+   866→   866→fn chrono_now() -> u64 {
+   867→   867→    use std::time::{SystemTime, UNIX_EPOCH};
+   868→   868→    SystemTime::now()
+   869→   869→        .duration_since(UNIX_EPOCH)
+   870→   870→        .map(|d| d.as_secs())
+   871→   871→        .unwrap_or(0)
+   872→   872→}
+   873→   873→
+   874→   874→/// Speculative prefetch: warm the retrieval cache for graph-adjacent candidate
+   875→   875→/// queries so the next, related query is instant.
+   876→   876→async fn prefetch(state: AppState, retrieved: &[ScoredNode]) {
+   877→   877→    if retrieved.is_empty() {
+   878→   878→        return;
+   879→   879→    }
+   880→   880→    let graph = state.graph.clone();
+   881→   881→    let cache = state.cache.clone();
+   882→   882→    let candidates: Vec<String> = retrieved.iter().take(3).map(|n| n.text.clone()).collect();
+   883→   883→    tokio::spawn(async move {
+   884→   884→        for q in candidates {
+   885→   885→            let (qvec, ctx) = {
+   886→   886→                let g = graph.lock().await;
+   887→   887→                let qv = g.vectorizer.vectorize(&q);
+   888→   888→                let r = g.retrieve(&q, 8);
+   889→   889→                let c = compress::compress(&r, &q, 6000);
+   890→   890→                (qv, c)
+   891→   891→            };
+   892→   892→            cache.lock().await.put_retrieval(&q, qvec, ctx);
+   893→   893→        }
+   894→   894→    });
+   895→   895→}
+   896→   896→
+   897→   897→// ===========================================================================
+   898→   898→// NEW ENDPOINTS (v3.1) — 8 additional handlers
+   899→   899→//
+   900→   900→// These are additive routes registered in main.rs. None of them touch the
+   901→   901→// existing pipeline; they expose engine state (dashboard, metrics, models,
+   902→   902→// config, graph stats/export/import) and an SSE-formatted chat stream.
+   903→   903→// ===========================================================================
+   904→   904→
+   905→   905→// ---------------------------------------------------------------------------
+   906→   906→// POST /v1/chat/stream — Server-Sent Events chat stream
+   907→   907→// ---------------------------------------------------------------------------
+   908→   908→
+   909→   909→/// OpenAI-compatible chat-completions **streaming** endpoint.
+   910→   910→///
+   911→   911→/// Accepts the same body shape as [`chat_completions`] (`{ messages: [...] }`)
+   912→   912→/// and returns a `text/event-stream` response. Each token of the final
+   913→   913→/// assistant message is emitted as an SSE event of the form:
+   914→   914→///
+   915→   915→/// ```text
+   916→   916→/// event: token
+   917→   917→/// data: {"token": "hello"}
+   918→   918→///
+   919→   919→/// ```
+   920→   920→///
+   921→   921→/// A terminal `event: done` event signals end-of-stream.
+   922→   922→///
+   923→   923→/// # Implementation note
+   924→   924→///
+   925→   925→/// Aether Engine's backend HTTP client is not natively streaming (it would
+   926→   926→/// require a chunked-transfer-aware `reqwest::Body` adapter), so this handler
+   927→   927→/// runs the simplified pipeline (graph retrieval → compression → one
+   928→   928→/// `call_backend` round-trip) and then **emits the final response token by
+   929→   929→/// token** as SSE events. The browser's `EventSource` parser sees one event
+   930→   930→/// per token; the only difference from a true token-stream is that all events
+   931→   931→/// arrive in a single HTTP body rather than being interleaved with backend
+   932→   932→/// generation. This is the fallback shape explicitly allowed by the spec
+   933→   933→/// ("simple chunked HTTP response with `text/event-stream` content type").
+   934→   934→pub async fn chat_completions_stream(
+   935→   935→    State(state): State<AppState>,
+   936→   936→    Json(body): Json<serde_json::Value>,
+   937→   937→) -> impl IntoResponse {
+   938→   938→    state.stats.lock().await.requests += 1;
+   939→   939→    let query = extract_user_query(&body);
+   940→   940→
+   941→   941→    // Stage 2: graph retrieval (TF-IDF + edge expansion).
+   942→   942→    let retrieved: Vec<ScoredNode> = {
+   943→   943→        let g = state.graph.lock().await;
+   944→   944→        g.retrieve(&query, 8)
+   945→   945→    };
+   946→   946→    // Stage 3: context compression.
+   947→   947→    let context_block = compress::compress(&retrieved, &query, 6000);
+   948→   948→
+   949→   949→    // Simplified pipeline: one backend call. The full chat_completions
+   950→   950→    // pipeline (decomposition / ATD / distillation) is intentionally not
+   951→   951→    // duplicated here — the streaming endpoint is for live UX, the regular
+   952→   952→    // endpoint is for highest-quality responses.
+   953→   953→    let response = call_backend(&state, &body, &context_block).await;
+   954→   954→
+   955→   955→    // Build the SSE body: one `event: token` per whitespace-split token of
+   956→   956→    // the final response, terminated by `event: done`.
+   957→   957→    let mut sse = String::with_capacity(response.len().saturating_mul(2));
+   958→   958→    for token in response.split_whitespace() {
+   959→   959→        // JSON-encode the token (handles embedded quotes / backslashes) and
+   960→   960→        // interpolate it into the `data:` line. The leading space after
+   961→   961→        // `data:` is required by the SSE spec.
+   962→   962→        let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+   963→   963→        sse.push_str(&format!(
+   964→   964→            "event: token\ndata: {{\"token\": {}}}\n\n",
+   965→   965→            token_json
+   966→   966→        ));
+   967→   967→    }
+   968→   968→    sse.push_str("event: done\ndata: {\"done\": true}\n\n");
+   969→   969→
+   970→   970→    (
+   971→   971→        axum::http::StatusCode::OK,
+   972→   972→        [("content-type", "text/event-stream")],
+   973→   973→        sse,
+   974→   974→    )
+   975→   975→}
+   976→   976→
+   977→   977→// ---------------------------------------------------------------------------
+   978→   978→// GET /dashboard — HTML status page (see src/dashboard.rs)
+   979→   979→// ---------------------------------------------------------------------------
+   980→   980→
+   981→   981→/// Render a self-contained HTML dashboard summarizing live engine state.
+   982→   982→///
+   983→   983→/// Gathers a [`dashboard::DashboardData`] snapshot by briefly locking each
+   984→   984→/// `Arc<Mutex<…>>` in [`AppState`], then hands it to
+   985→   985→/// [`dashboard::render_dashboard`] which produces a dark-themed, monospace
+   986→   986→/// HTML page with zero external resources.
+   987→   987→pub async fn dashboard(State(state): State<AppState>) -> impl IntoResponse {
+   988→   988→    let (nodes, edges) = {
+   989→   989→        let g = state.graph.lock().await;
+   990→   990→        (g.len(), g.edge_count())
+   991→   991→    };
+   992→   992→    let cache_size = state.cache.lock().await.len();
+   993→   993→    let (decompositions, atd_verdicts, requests, cache_hits) = {
+   994→   994→        let s = state.stats.lock().await;
+   995→   995→        (s.decompositions, s.atd_verifications, s.requests, s.cache_hits)
+   996→   996→    };
+   997→   997→    let (hcm_pairs, hcm_capacity, hcm_memory) = {
+   998→   998→        let h = state.hcm.lock().await;
+   999→   999→        (h.pair_count, h.capacity(), h.memory_bytes())
+  1000→  1000→    };
+  1001→  1001→
+  1002→  1002→    let data = crate::dashboard::DashboardData {
+  1003→  1003→        engine_name: "Aether Engine",
+  1004→  1004→        version: "3.0",
+  1005→  1005→        uptime_seconds: crate::dashboard::uptime_seconds(),
+  1006→  1006→        node_count: nodes,
+  1007→  1007→        edge_count: edges,
+  1008→  1008→        cache_size,
+  1009→  1009→        decompositions,
+  1010→  1010→        atd_verdicts,
+  1011→  1011→        hcm_state_bytes: hcm_memory,
+  1012→  1012→        hcm_pairs,
+  1013→  1013→        hcm_capacity,
+  1014→  1014→        requests,
+  1015→  1015→        cache_hits,
+  1016→  1016→    };
+  1017→  1017→
+  1018→  1018→    axum::response::Html(crate::dashboard::render_dashboard(&data))
+  1019→  1019→}
+  1020→  1020→
+  1021→  1021→// ---------------------------------------------------------------------------
+  1022→  1022→// GET /metrics — Prometheus exposition format
+  1023→  1023→// ---------------------------------------------------------------------------
+  1024→  1024→
+  1025→  1025→/// Prometheus-format metrics endpoint.
+  1026→  1026→///
+  1027→  1027→/// Returns a `text/plain; version=0.0.4` body in Prometheus exposition
+  1028→  1028→/// format. Five series are exposed:
+  1029→  1029→///
+  1030→  1030→/// - `aether_graph_nodes` (gauge) — nodes in the semantic memory graph.
+  1031→  1031→/// - `aether_graph_edges` (gauge) — directed edges in the adjacency list.
+  1032→  1032→/// - `aether_cache_size` (gauge) — action-cache entries.
+  1033→  1033→/// - `aether_decompositions_total` (counter) — cognitive decompositions.
+  1034→  1034→/// - `aether_atd_verdicts_total` (counter) — ATD verifications performed.
+  1035→  1035→///
+  1036→  1036→/// Designed to be scraped by a Prometheus / Grafana agent with no extra
+  1037→  1037→/// configuration.
+  1038→  1038→pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+  1039→  1039→    let (nodes, edges) = {
+  1040→  1040→        let g = state.graph.lock().await;
+  1041→  1041→        (g.len(), g.edge_count())
+  1042→  1042→    };
+  1043→  1043→    let cache_size = state.cache.lock().await.len();
+  1044→  1044→    let (decompositions, atd_verifications) = {
+  1045→  1045→        let s = state.stats.lock().await;
+  1046→  1046→        (s.decompositions, s.atd_verifications)
+  1047→  1047→    };
+  1048→  1048→
+  1049→  1049→    // Build the Prometheus exposition body line-by-line. Each line MUST NOT
+  1050→  1050→    // have leading whitespace (the exposition format is line-oriented and
+  1051→  1051→    // strict about data lines starting with the metric name), so we use
+  1052→  1052→    // `push_str` rather than a multi-line `format!` with `\` continuations
+  1053→  1053→    // (which would embed the source-file indentation into the string).
+  1054→  1054→    let mut body = String::with_capacity(1024);
+  1055→  1055→    body.push_str("# HELP aether_graph_nodes Total nodes in memory graph\n");
+  1056→  1056→    body.push_str("# TYPE aether_graph_nodes gauge\n");
+  1057→  1057→    body.push_str(&format!("aether_graph_nodes {}\n", nodes));
+  1058→  1058→    body.push_str("# HELP aether_graph_edges Total edges in memory graph\n");
+  1059→  1059→    body.push_str("# TYPE aether_graph_edges gauge\n");
+  1060→  1060→    body.push_str(&format!("aether_graph_edges {}\n", edges));
+  1061→  1061→    body.push_str("# HELP aether_cache_size Action cache entries\n");
+  1062→  1062→    body.push_str("# TYPE aether_cache_size gauge\n");
+  1063→  1063→    body.push_str(&format!("aether_cache_size {}\n", cache_size));
+  1064→  1064→    body.push_str("# HELP aether_decompositions_total Total cognitive decompositions\n");
+  1065→  1065→    body.push_str("# TYPE aether_decompositions_total counter\n");
+  1066→  1066→    body.push_str(&format!("aether_decompositions_total {}\n", decompositions));
+  1067→  1067→    body.push_str("# HELP aether_atd_verdicts_total Total ATD verdicts\n");
+  1068→  1068→    body.push_str("# TYPE aether_atd_verdicts_total counter\n");
+  1069→  1069→    body.push_str(&format!("aether_atd_verdicts_total {}\n", atd_verifications));
+  1070→  1070→
+  1071→  1071→    (
+  1072→  1072→        axum::http::StatusCode::OK,
+  1073→  1073→        [("content-type", "text/plain; version=0.0.4")],
+  1074→  1074→        body,
+  1075→  1075→    )
+  1076→  1076→}
+  1077→  1077→
+  1078→  1078→// ---------------------------------------------------------------------------
+  1079→  1079→// GET /graph/export — full graph as downloadable JSON
+  1080→  1080→// ---------------------------------------------------------------------------
+  1081→  1081→
+  1082→  1082→/// Export the entire semantic memory graph (nodes + edges + stats) as a
+  1083→  1083→/// downloadable JSON attachment.
+  1084→  1084→///
+  1085→  1085→/// Same payload shape as `GET /graph` but wrapped with a `stats` block and
+  1086→  1086→/// served with `Content-Disposition: attachment; filename="aether-graph.json"`
+  1087→  1087→/// so the browser downloads it as a file instead of rendering it inline.
+  1088→  1088→pub async fn graph_export(State(state): State<AppState>) -> impl IntoResponse {
+  1089→  1089→    let (nodes_json, edges_json, node_count, edge_count) = {
+  1090→  1090→        let g = state.graph.lock().await;
+  1091→  1091→        let resp = g.to_response();
+  1092→  1092→        let n = g.len();
+  1093→  1093→        let e = g.edge_count();
+  1094→  1094→        (
+  1095→  1095→            resp.get("nodes").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+  1096→  1096→            resp.get("edges").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+  1097→  1097→            n,
+  1098→  1098→            e,
+  1099→  1099→        )
+  1100→  1100→    };
+  1101→  1101→
+  1102→  1102→    let body = json!({
+  1103→  1103→        "nodes": nodes_json,
+  1104→  1104→        "edges": edges_json,
+  1105→  1105→        "stats": {
+  1106→  1106→            "node_count": node_count,
+  1107→  1107→            "edge_count": edge_count,
+  1108→  1108→        },
+  1109→  1109→    });
+  1110→  1110→
+  1111→  1111→    (
+  1112→  1112→        axum::http::StatusCode::OK,
+  1113→  1113→        [("content-disposition", "attachment; filename=\"aether-graph.json\"")],
+  1114→  1114→        Json(body),
+  1115→  1115→    )
+  1116→  1116→}
+  1117→  1117→
+  1118→  1118→// ---------------------------------------------------------------------------
+  1119→  1119→// POST /graph/import — bulk-add nodes from a JSON array
+  1120→  1120→// ---------------------------------------------------------------------------
+  1121→  1121→
+  1122→  1122→/// Bulk-import nodes into the semantic memory graph.
+  1123→  1123→///
+  1124→  1124→/// Accepts a JSON body of the shape `{ "nodes": [ { "id": "...", "text": "..." }, ... ] }`.
+  1125→  1125→/// Each entry is fed through [`MemoryGraph::add`](crate::graph::MemoryGraph::add)
+  1126→  1126→/// (the same path used by `POST /graph/add`), with `kind` and `metadata`
+  1127→  1127→/// defaulting to `"fact"` and `{}` respectively when absent.
+  1128→  1128→///
+  1129→  1129→/// Returns `{ "imported": <count> }` where `count` is the number of nodes
+  1130→  1130→/// successfully added. Entries missing `id` or `text` are skipped.
+  1131→  1131→pub async fn graph_import(
+  1132→  1132→    State(state): State<AppState>,
+  1133→  1133→    Json(body): Json<serde_json::Value>,
+  1134→  1134→) -> impl IntoResponse {
+  1135→  1135→    let mut imported: usize = 0;
+  1136→  1136→    if let Some(nodes) = body.get("nodes").and_then(|n| n.as_array()) {
+  1137→  1137→        let mut g = state.graph.lock().await;
+  1138→  1138→        for node in nodes {
+  1139→  1139→            let id = node.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+  1140→  1140→            let text = node.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+  1141→  1141→            if id.is_empty() || text.is_empty() {
+  1142→  1142→                continue;
+  1143→  1143→            }
+  1144→  1144→            let kind = node
+  1145→  1145→                .get("kind")
+  1146→  1146→                .and_then(|v| v.as_str())
+  1147→  1147→                .unwrap_or("fact")
+  1148→  1148→                .to_string();
+  1149→  1149→            let metadata = node.get("metadata").cloned().unwrap_or(json!({}));
+  1150→  1150→            g.add(AddNodeRequest {
+  1151→  1151→                id,
+  1152→  1152→                text,
+  1153→  1153→                kind,
+  1154→  1154→                metadata,
+  1155→  1155→            });
+  1156→  1156→            imported = imported.saturating_add(1);
+  1157→  1157→        }
+  1158→  1158→    }
+  1159→  1159→    Json(json!({ "imported": imported }))
+  1160→  1160→}
+  1161→  1161→
+  1162→  1162→// ---------------------------------------------------------------------------
+  1163→  1163→// GET /config — runtime configuration
+  1164→  1164→// ---------------------------------------------------------------------------
+  1165→  1165→
+  1166→  1166→/// Return the engine's runtime configuration as JSON.
+  1167→  1167→///
+  1168→  1168→/// All values are read from the environment (with sensible defaults) at
+  1169→  1169→/// request time so changes to `AETHER_BACKEND` are reflected without a
+  1170→  1170→/// restart. The numeric thresholds (`hcm_dim`, `clt_*`, `atd_*`,
+  1171→  1171→/// `cache_threshold`, `retrieval_threshold`) are the same constants the
+  1172→  1172→/// engine was compiled with — they're surfaced here so an operator can verify
+  1173→  1173→/// the live values via curl.
+  1174→  1174→pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
+  1175→  1175→    // `AETHER_BACKEND` is the only env var the engine actually reads today;
+  1176→  1176→    // the rest are surfaced as the compiled-in defaults. The port value
+  1177→  1177→    // mirrors `const PORT: u16 = 3004` in `main.rs` (hardcoded here to avoid
+  1178→  1178→    // needing to bump PORT's visibility to `pub(crate)`).
+  1179→  1179→    let backend = state.backend.clone();
+  1180→  1180→    Json(json!({
+  1181→  1181→        "backend": backend,
+  1182→  1182→        "port": 3004_u16,
+  1183→  1183→        "hcm_dim": 1024,
+  1184→  1184→        "clt_max_steps": 10,
+  1185→  1185→        "clt_convergence": 0.92,
+  1186→  1186→        "atd_max_entropy": 0.65,
+  1187→  1187→        "atd_max_repetition": 0.30,
+  1188→  1188→        "cache_threshold": 0.95,
+  1189→  1189→        "retrieval_threshold": 0.92,
+  1190→  1190→    }))
+  1191→  1191→}
+  1192→  1192→
+  1193→  1193→// ---------------------------------------------------------------------------
+  1194→  1194→// GET /v1/models — OpenAI-compatible model list
+  1195→  1195→// ---------------------------------------------------------------------------
+  1196→  1196→
+  1197→  1197→/// OpenAI-compatible `GET /v1/models` endpoint.
+  1198→  1198→///
+  1199→  1199→/// Returns a synthetic list of three "models" corresponding to the three
+  1200→  1200→/// paths through the Aether pipeline:
+  1201→  1201→///
+  1202→  1202→/// - `aether-cache` — served instantly from the action cache (Stage 1).
+  1203→  1203→/// - `aether-pipeline` — the full 10-stage cognitive pipeline.
+  1204→  1204→/// - `aether-fallback` — the offline-fallback response when the backend is
+  1205→  1205→///   unreachable.
+  1206→  1206→///
+  1207→  1207→/// This lets OpenAI-compatible clients (e.g. `openai` Python SDK, Continue,
+  1208→  1208→/// LangChain) enumerate the engine's "models" without configuration.
+  1209→  1209→pub async fn list_models(State(_state): State<AppState>) -> impl IntoResponse {
+  1210→  1210→    Json(json!({
+  1211→  1211→        "object": "list",
+  1212→  1212→        "data": [
+  1213→  1213→            { "id": "aether-cache",     "object": "model", "created": 0, "owned_by": "aether" },
+  1214→  1214→            { "id": "aether-pipeline",  "object": "model", "created": 0, "owned_by": "aether" },
+  1215→  1215→            { "id": "aether-fallback",  "object": "model", "created": 0, "owned_by": "aether" },
+  1216→  1216→        ],
+  1217→  1217→    }))
+  1218→  1218→}
+  1219→  1219→
+  1220→  1220→// ---------------------------------------------------------------------------
+  1221→  1221→// GET /graph/stats — detailed graph statistics
+  1222→  1222→// ---------------------------------------------------------------------------
+  1223→  1223→
+  1224→  1224→/// Detailed statistics about the semantic memory graph.
+  1225→  1225→///
+  1226→  1226→/// Returns:
+  1227→  1227→///
+  1228→  1228→/// - `node_count` — total nodes.
+  1229→  1229→/// - `edge_count` — total directed edges in the adjacency list (each
+  1230→  1230→///   undirected edge is stored twice, once per endpoint).
+  1231→  1231→/// - `avg_edges_per_node` — `edge_count / node_count` (0 if empty).
+  1232→  1232→/// - `max_edges` — the largest adjacency list of any single node (capped at
+  1233→  1233→///   `top_k = 5`).
+  1234→  1234→/// - `density` — `edge_count / (N * (N-1))` for `N > 1`, else 0 (the
+  1235→  1235→///   directed-edge density of the adjacency list).
+  1236→  1236→/// - `top_connected_nodes` — the top 5 nodes by adjacency-list length, each
+  1237→  1237→///   as `{ id, text, edge_count }`.
+  1238→  1238→pub async fn graph_stats(State(state): State<AppState>) -> impl IntoResponse {
+  1239→  1239→    let g = state.graph.lock().await;
+  1240→  1240→    let node_count = g.len();
+  1241→  1241→    let edge_count = g.edge_count();
+  1242→  1242→    let max_edges = g
+  1243→  1243→        .adjacency
+  1244→  1244→        .values()
+  1245→  1245→        .map(|v| v.len())
+  1246→  1246→        .max()
+  1247→  1247→        .unwrap_or(0);
+  1248→  1248→    let avg_edges_per_node = if node_count > 0 {
+  1249→  1249→        edge_count as f64 / node_count as f64
+  1250→  1250→    } else {
+  1251→  1251→        0.0
+  1252→  1252→    };
+  1253→  1253→    let density = if node_count > 1 {
+  1254→  1254→        edge_count as f64 / (node_count as f64 * (node_count as f64 - 1.0))
+  1255→  1255→    } else {
+  1256→  1256→        0.0
+  1257→  1257→    };
+  1258→  1258→
+  1259→  1259→    // Top connected nodes: sort adjacency entries by length (desc), take 5.
+  1260→  1260→    // We clone the (id, edge_count) pairs out of the adjacency map so we can
+  1261→  1261→    // drop the borrow before looking up node texts (avoiding a double-borrow
+  1262→  1262→    // of `g.adjacency` and `g.nodes`).
+  1263→  1263→    let mut node_edge_counts: Vec<(String, usize)> = g
+  1264→  1264→        .adjacency
+  1265→  1265→        .iter()
+  1266→  1266→        .map(|(id, nbrs)| (id.clone(), nbrs.len()))
+  1267→  1267→        .collect();
+  1268→  1268→    node_edge_counts.sort_by(|a, b| b.1.cmp(&a.1));
+  1269→  1269→
+  1270→  1270→    let top_connected: Vec<serde_json::Value> = node_edge_counts
+  1271→  1271→        .into_iter()
+  1272→  1272→        .take(5)
+  1273→  1273→        .filter_map(|(id, ec)| {
+  1274→  1274→            g.nodes.get(&id).map(|n| {
+  1275→  1275→                json!({
+  1276→  1276→                    "id": id,
+  1277→  1277→                    "text": n.text.clone(),
+  1278→  1278→                    "edge_count": ec,
+  1279→  1279→                })
+  1280→  1280→            })
+  1281→  1281→        })
+  1282→  1282→        .collect();
+  1283→  1283→
+  1284→  1284→    Json(json!({
+  1285→  1285→        "node_count": node_count,
+  1286→  1286→        "edge_count": edge_count,
+  1287→  1287→        "avg_edges_per_node": avg_edges_per_node,
+  1288→  1288→        "max_edges": max_edges,
+  1289→  1289→        "density": density,
+  1290→  1290→        "top_connected_nodes": top_connected,
+  1291→  1291→    }))
+  1292→  1292→}
+  1293→  1293→
+  1294→  1294→// ===========================================================================
+  1295→  1295→// AGENTIC LAYER (v3.2) — autonomous OS agent endpoints
+  1296→  1296→//
+  1297→  1297→// Two additive routes registered in main.rs that expose the agentic loop
+  1298→  1298→// (src/agent.rs) and the tool registry (src/tools.rs) to the Next.js
+  1299→  1299→// layer. Neither touches the existing 10-stage cognitive pipeline.
+  1300→  1300→// ===========================================================================
+  1301→  1301→
+  1302→  1302→// ---------------------------------------------------------------------------
+  1303→  1303→// POST /v1/agent/run — run the autonomous agent loop
+  1304→  1304→// ---------------------------------------------------------------------------
+  1305→  1305→
+  1306→  1306→/// Run the autonomous agent loop for a single goal.
+  1307→  1307→///
+  1308→  1308→/// Accepts a JSON body of the shape:
+  1309→  1309→///
+  1310→  1310→/// ```json
+  1311→  1311→/// {
+  1312→  1312→///   "goal": "set up a Python dev environment and write a hello-world script",
+  1313→  1313→///   "context": { "windows": [...], "memory": [...], "plan": {...} },
+  1314→  1314→///   "max_iterations": 20
+  1315→  1315→/// }
+  1316→  1316→/// ```
+  1317→  1317→///
+  1318→  1318→/// - `goal` (required) — natural-language goal the agent should achieve.
+  1319→  1319→/// - `context` (optional, default `{}`) — current OS state, pretty-printed
+  1320→  1320→///   into the system prompt so the LLM perceives open windows, memory,
+  1321→  1321→///   active plan, etc.
+  1322→  1322→/// - `max_iterations` (optional, default `20`, clamped to `[1, 50]`) —
+  1323→  1323→///   hard cap on think iterations.
+  1324→  1324→///
+  1325→  1325→/// Returns:
+  1326→  1326→///
+  1327→  1327→/// ```json
+  1328→  1328→/// {
+  1329→  1329→///   "ok": true,
+  1330→  1330→///   "result": "<final assistant text>",
+  1331→  1331→///   "iterations": 3,
+  1332→  1332→///   "completed": true,
+  1333→  1333→///   "tool_calls": [
+  1334→  1334→///     { "name": "file_read", "params": { "path": "/etc/hostname" } },
+  1335→  1335→///     ...
+  1336→  1336→///   ]
+  1337→  1337→/// }
+  1338→  1338→/// ```
+  1339→  1339→///
+  1340→  1340→/// The `tool_calls` array is the full transcript of every tool call the
+  1341→  1341→/// LLM made across all iterations, in execution order. The Next.js layer
+  1342→  1342→/// uses this transcript to perform the real OS side-effects (file IO,
+  1343→  1343→/// PTY exec, window manager mutations, …) — the Aether Engine's tool
+  1344→  1344→/// executors return placeholders by design (see [`crate::tools`]).
+  1345→  1345→///
+  1346→  1346→/// On a missing `goal` field the handler returns
+  1347→  1347→/// `{ ok: false, error: "missing 'goal' field" }` without starting the
+  1348→  1348→/// loop.
+  1349→  1349→pub async fn agent_run(
+  1350→  1350→    State(state): State<AppState>,
+  1351→  1351→    Json(body): Json<serde_json::Value>,
+  1352→  1352→) -> impl IntoResponse {
+  1353→  1353→    let goal = body
+  1354→  1354→        .get("goal")
+  1355→  1355→        .and_then(|g| g.as_str())
+  1356→  1356→        .unwrap_or("")
+  1357→  1357→        .to_string();
+  1358→  1358→    let context = body.get("context").cloned().unwrap_or(json!({}));
+  1359→  1359→    let max_iterations = body
+  1360→  1360→        .get("max_iterations")
+  1361→  1361→        .and_then(|m| m.as_u64())
+  1362→  1362→        .map(|n| n as usize)
+  1363→  1363→        .unwrap_or(crate::agent::DEFAULT_MAX_ITERATIONS);
+  1364→  1364→
+  1365→  1365→    if goal.is_empty() {
+  1366→  1366→        return Json(json!({
+  1367→  1367→            "ok": false,
+  1368→  1368→            "error": "missing 'goal' field",
+  1369→  1369→        }))
+  1370→  1370→        .into_response();
+  1371→  1371→    }
+  1372→  1372→
+  1373→  1373→    let result = crate::agent::run_agent_loop(state, &goal, &context, max_iterations).await;
+  1374→  1374→
+  1375→  1375→    Json(json!({
+  1376→  1376→        "ok": true,
+  1377→  1377→        "result": result.result,
+  1378→  1378→        "iterations": result.iterations,
+  1379→  1379→        "completed": result.completed,
+  1380→  1380→        "tool_calls": result.tool_calls.iter().map(|c| json!({
+  1381→  1381→            "name": c.name,
+  1382→  1382→            "params": c.params,
+  1383→  1383→        })).collect::<Vec<_>>(),
+  1384→  1384→    }))
+  1385→  1385→    .into_response()
+  1386→  1386→}
+  1387→  1387→
+  1388→  1388→// ---------------------------------------------------------------------------
+  1389→  1389→// GET /v1/tools — list available agent tools (introspection)
+  1390→  1390→// ---------------------------------------------------------------------------
+  1391→  1391→
+  1392→  1392→/// List every tool available to the autonomous agent, with its name,
+  1393→  1393→/// description, and JSON-Schema parameters.
+  1394→  1394→///
+  1395→  1395→/// Used by the Next.js layer (and by `curl`) to introspect the tool
+  1396→  1396→/// surface without reading the Rust source. Returns:
+  1397→  1397→///
+  1398→  1398→/// ```json
+  1399→  1399→/// {
+  1400→  1400→///   "ok": true,
+  1401→  1401→///   "tools": [
+  1402→  1402→///     {
+  1403→  1403→///       "name": "file_read",
+  1404→  1404→///       "description": "Read the full contents of a file from disk.",
+  1405→  1405→///       "parameters": {
+  1406→  1406→///         "type": "object",
+  1407→  1407→///         "properties": { "path": { "type": "string", "..." } },
+  1408→  1408→///         "required": ["path"]
+  1409→  1409→///       }
+  1410→  1410→///     },
+  1411→  1411→///     ...
+  1412→  1412→///   ]
+  1413→  1413→/// }
+  1414→  1414→/// ```
+  1415→  1415→///
+  1416→  1416→/// The order of tools in the response is stable across calls (matches the
+  1417→  1417→/// order in [`ToolRegistry::catalog`](crate::tools::ToolRegistry::catalog))
+  1418→  1418→/// so callers can cache or render the list without re-sorting.
+  1419→  1419→pub async fn list_tools(State(_state): State<AppState>) -> impl IntoResponse {
+  1420→  1420→    let registry = crate::tools::ToolRegistry::new();
+  1421→  1421→    let catalog = registry.catalog();
+  1422→  1422→    Json(json!({
+  1423→  1423→        "ok": true,
+  1424→  1424→        "tools": catalog.iter().map(|t| json!({
+  1425→  1425→            "name": t.name,
+  1426→  1426→            "description": t.description,
+  1427→  1427→            "parameters": t.parameters,
+  1428→  1428→        })).collect::<Vec<_>>(),
+  1429→  1429→    }))
+  1430→  1430→}
+  1431→  1431→

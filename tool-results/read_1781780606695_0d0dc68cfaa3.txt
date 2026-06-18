@@ -1,0 +1,660 @@
+     1→     1→//! # Tools — OS-control tool definitions for the Aether agentic layer.
+     2→     2→//!
+     3→     3→//! This module defines the **tool surface** the autonomous agent can use to
+     4→     4→//! perceive and manage a Linux-like OS. Each tool is:
+     5→     5→//!
+     6→     6→//! - a [`Tool`] enum variant (carries the parsed parameters),
+     7→     7→//! - a [`ToolSpec`] entry in the [`ToolRegistry`] catalog (carries the
+     8→     8→//!   name + description + JSON-Schema parameters used to advertise the tool
+     9→     9→//!   to the LLM and to the `GET /v1/tools` introspection endpoint),
+    10→    10→//! - a dispatch arm in [`ToolRegistry::execute`] (carries the placeholder
+    11→    11→//!   executor).
+    12→    12→//!
+    13→    13→//! # Why placeholders?
+    14→    14→//!
+    15→    15→//! The Aether Engine runs as a Rust HTTP service; it does not itself touch
+    16→    16→//! the filesystem, spawn shells, or open GUI windows. The actual OS
+    17→    17→//! integration happens through the Next.js layer in Alpha-OS, which:
+    18→    18→//!
+    19→    19→//! 1. Calls `POST /v1/agent/run` to start the agentic loop,
+    20→    20→//! 2. Receives the parsed [`ToolCall`](crate::agent::ToolCall)s back as JSON,
+    21→    21→//! 3. Performs the real OS action (file IO, PTY exec, window manager
+    22→    22→//!    mutation, graph memory add, …),
+    23→    23→//! 4. Feeds the resulting observation back into the next agent iteration via
+    24→    24→//!    the `context` field of the next `POST /v1/agent/run` call.
+    25→    25→//!
+    26→    26→//! The placeholder executors here return **canonical "what would happen"
+    27→    27→//! responses** so the agent loop can be tested end-to-end (perceive → think
+    28→    28→//! → act → observe) before the OS wiring is complete, and so the structure
+    29→    29→//! of the tool registry is exercised by every iteration even when no real
+    30→    30→//! side-effects are available.
+    31→    31→//!
+    32→    32→//! # Adding a new tool
+    33→    33→//!
+    34→    34→//! 1. Add a variant to [`Tool`] carrying its parsed parameters.
+    35→    35→//! 2. Add a `(name, description, schema)` triple to
+    36→    36→//!    [`ToolRegistry::catalog`].
+    37→    37→//! 3. Add a dispatch arm to [`ToolRegistry::execute`] returning a
+    38→    38→//!    placeholder result.
+    39→    39→//! 4. Add a constructor arm to [`Tool::from_request`].
+    40→    40→
+    41→    41→use serde_json::{json, Value};
+    42→    42→
+    43→    43→// ---------------------------------------------------------------------------
+    44→    44→// Tool enum — one variant per available tool, carrying parsed params
+    45→    45→// ---------------------------------------------------------------------------
+    46→    46→
+    47→    47→/// A parsed tool call — the variant identifies *which* tool, and the fields
+    48→    48→/// carry the validated parameters extracted from the LLM's JSON payload by
+    49→    49→/// [`Tool::from_request`].
+    50→    50→///
+    51→    51→/// Variants are constructed only by [`Tool::from_request`]; the agent loop
+    52→    52→/// never builds them directly. Unknown tool names or missing required
+    53→    53→/// parameters yield `None`, which the agent loop surfaces as a
+    54→    54→/// `tool_not_found` error message back to the LLM.
+    55→    55→#[derive(Clone, Debug)]
+    56→    56→pub enum Tool {
+    57→    57→    /// Read a file from disk. Returns the file contents as a UTF-8 string.
+    58→    58→    FileRead {
+    59→    59→        /// Absolute or relative path of the file to read.
+    60→    60→        path: String,
+    61→    61→    },
+    62→    62→    /// Write `content` to `path`, overwriting if the file already exists and
+    63→    63→    /// creating it (including parent directories) if it does not.
+    64→    64→    FileWrite {
+    65→    65→        /// Path of the file to write.
+    66→    66→        path: String,
+    67→    67→        /// The full text content to write.
+    68→    68→        content: String,
+    69→    69→    },
+    70→    70→    /// List the entries of a directory. Returns `{ name, is_dir }` per entry.
+    71→    71→    FileList {
+    72→    72→        /// Path of the directory to list.
+    73→    73→        path: String,
+    74→    74→    },
+    75→    75→    /// Delete a file or directory. Directories are removed recursively.
+    76→    76→    FileDelete {
+    77→    77→        /// Path of the file or directory to delete.
+    78→    78→        path: String,
+    79→    79→    },
+    80→    80→    /// Run a shell command in the user's default shell. Returns
+    81→    81→    /// `{ stdout, stderr, exit_code }`.
+    82→    82→    Exec {
+    83→    83→        /// The full shell command line (interpreted by `/bin/bash -c`).
+    84→    84→        command: String,
+    85→    85→    },
+    86→    86→    /// Open an application window in the Alpha-OS desktop.
+    87→    87→    WindowOpen {
+    88→    88→        /// App identifier (e.g. `"terminal"`, `"editor"`, `"browser"`).
+    89→    89→        app: String,
+    90→    90→    },
+    91→    91→    /// Close an open application window by its id.
+    92→    92→    WindowClose {
+    93→    93→        /// The window id returned by `window_open` or listed in the OS state.
+    94→    94→        window_id: String,
+    95→    95→    },
+    96→    96→    /// Add a memory to Akasha (the semantic memory graph). The memory
+    97→    97→    /// becomes a new node and is automatically linked to its semantic
+    98→    98→    /// neighbors.
+    99→    99→    MemoryAdd {
+   100→   100→        /// The memory text.
+   101→   101→        text: String,
+   102→   102→        /// Memory kind: `"fact"`, `"lesson"`, `"plan"`, `"goal"`,
+   103→   103→        /// `"intention"`, `"log"`, or `"code"`.
+   104→   104→        kind: String,
+   105→   105→    },
+   106→   106→    /// Search the semantic memory graph for memories matching `query`.
+   107→   107→    /// Returns the top results with cosine-similarity scores.
+   108→   108→    MemorySearch {
+   109→   109→        /// The free-text query to search for.
+   110→   110→        query: String,
+   111→   111→    },
+   112→   112→    /// Search the public web for `query`. Returns a list of result snippets
+   113→   113→    /// with URLs.
+   114→   114→    WebSearch {
+   115→   115→        /// The search query.
+   116→   116→        query: String,
+   117→   117→    },
+   118→   118→    /// Create a multi-step plan. The plan is stored and surfaced back to the
+   119→   119→    /// agent on subsequent iterations as part of the OS state, so the agent
+   120→   120→    /// can track its progress through the steps.
+   121→   121→    PlanCreate {
+   122→   122→        /// The high-level goal the plan achieves.
+   123→   123→        goal: String,
+   124→   124→        /// The ordered list of step descriptions.
+   125→   125→        steps: Vec<String>,
+   126→   126→    },
+   127→   127→    /// Mark a step in the current plan as done. Steps are 0-indexed.
+   128→   128→    PlanUpdate {
+   129→   129→        /// The index of the step to mark as done.
+   130→   130→        step_index: usize,
+   131→   131→    },
+   132→   132→}
+   133→   133→
+   134→   134→impl Tool {
+   135→   135→    /// Canonical name the LLM uses to reference this tool. Mirrors the
+   136→   136→    /// `name` field in the corresponding [`ToolSpec`].
+   137→   137→    pub fn name(&self) -> &'static str {
+   138→   138→        match self {
+   139→   139→            Tool::FileRead { .. } => "file_read",
+   140→   140→            Tool::FileWrite { .. } => "file_write",
+   141→   141→            Tool::FileList { .. } => "file_list",
+   142→   142→            Tool::FileDelete { .. } => "file_delete",
+   143→   143→            Tool::Exec { .. } => "exec",
+   144→   144→            Tool::WindowOpen { .. } => "window_open",
+   145→   145→            Tool::WindowClose { .. } => "window_close",
+   146→   146→            Tool::MemoryAdd { .. } => "memory_add",
+   147→   147→            Tool::MemorySearch { .. } => "memory_search",
+   148→   148→            Tool::WebSearch { .. } => "web_search",
+   149→   149→            Tool::PlanCreate { .. } => "plan_create",
+   150→   150→            Tool::PlanUpdate { .. } => "plan_update",
+   151→   151→        }
+   152→   152→    }
+   153→   153→
+   154→   154→    /// Human-readable description shown to the LLM in the system prompt and
+   155→   155→    /// to clients via `GET /v1/tools`. Mirrors the `description` field in
+   156→   156→    /// the corresponding [`ToolSpec`].
+   157→   157→    pub fn description(&self) -> &'static str {
+   158→   158→        match self {
+   159→   159→            Tool::FileRead { .. } => "Read the full contents of a file from disk.",
+   160→   160→            Tool::FileWrite { .. } => {
+   161→   161→                "Write text content to a file, overwriting if present and creating \
+   162→   162→                 parent directories as needed."
+   163→   163→            }
+   164→   164→            Tool::FileList { .. } => "List the entries of a directory.",
+   165→   165→            Tool::FileDelete { .. } => {
+   166→   166→                "Delete a file or directory (directories are removed recursively)."
+   167→   167→            }
+   168→   168→            Tool::Exec { .. } => {
+   169→   169→                "Run a shell command in the user's default shell and return \
+   170→   170→                 stdout, stderr, and exit code."
+   171→   171→            }
+   172→   172→            Tool::WindowOpen { .. } => "Open an application window on the OS desktop.",
+   173→   173→            Tool::WindowClose { .. } => "Close an open application window by id.",
+   174→   174→            Tool::MemoryAdd { .. } => {
+   175→   175→                "Add a memory (fact/lesson/plan/goal/intention/log/code) to \
+   176→   176→                 the Akasha semantic memory graph."
+   177→   177→            }
+   178→   178→            Tool::MemorySearch { .. } => {
+   179→   179→                "Search the semantic memory graph for matching memories, \
+   180→   180→                 ranked by cosine similarity."
+   181→   181→            }
+   182→   182→            Tool::WebSearch { .. } => "Search the public web for fresh information.",
+   183→   183→            Tool::PlanCreate { .. } => {
+   184→   184→                "Create a multi-step plan for a goal. The plan is persisted \
+   185→   185→                 and surfaced back to the agent on subsequent iterations."
+   186→   186→            }
+   187→   187→            Tool::PlanUpdate { .. } => "Mark a step (0-indexed) in the current plan as done.",
+   188→   188→        }
+   189→   189→    }
+   190→   190→
+   191→   191→    /// Construct a [`Tool`] from a `(name, params)` pair extracted from the
+   192→   192→    /// LLM's tool-call payload by
+   193→   193→    /// [`parse_tool_calls`](crate::agent::parse_tool_calls).
+   194→   194→    ///
+   195→   195→    /// Returns `None` when:
+   196→   196→    /// - the tool name is unknown to the registry,
+   197→   197→    /// - a required parameter is missing,
+   198→   198→    /// - a parameter has the wrong JSON type.
+   199→   199→    ///
+   200→   200→    /// The agent loop converts `None` into a `tool_not_found` /
+   201→   201→    /// `invalid_params` tool-result message so the LLM can self-correct on
+   202→   202→    /// the next iteration.
+   203→   203→    pub fn from_request(name: &str, params: &Value) -> Option<Self> {
+   204→   204→        match name {
+   205→   205→            "file_read" => {
+   206→   206→                let path = params.get("path")?.as_str()?.to_string();
+   207→   207→                Some(Tool::FileRead { path })
+   208→   208→            }
+   209→   209→            "file_write" => {
+   210→   210→                let path = params.get("path")?.as_str()?.to_string();
+   211→   211→                let content = params
+   212→   212→                    .get("content")
+   213→   213→                    .and_then(|c| c.as_str())
+   214→   214→                    .unwrap_or("")
+   215→   215→                    .to_string();
+   216→   216→                Some(Tool::FileWrite { path, content })
+   217→   217→            }
+   218→   218→            "file_list" => {
+   219→   219→                let path = params.get("path")?.as_str()?.to_string();
+   220→   220→                Some(Tool::FileList { path })
+   221→   221→            }
+   222→   222→            "file_delete" => {
+   223→   223→                let path = params.get("path")?.as_str()?.to_string();
+   224→   224→                Some(Tool::FileDelete { path })
+   225→   225→            }
+   226→   226→            "exec" => {
+   227→   227→                let command = params.get("command")?.as_str()?.to_string();
+   228→   228→                Some(Tool::Exec { command })
+   229→   229→            }
+   230→   230→            "window_open" => {
+   231→   231→                let app = params.get("app")?.as_str()?.to_string();
+   232→   232→                Some(Tool::WindowOpen { app })
+   233→   233→            }
+   234→   234→            "window_close" => {
+   235→   235→                let window_id = params.get("window_id")?.as_str()?.to_string();
+   236→   236→                Some(Tool::WindowClose { window_id })
+   237→   237→            }
+   238→   238→            "memory_add" => {
+   239→   239→                let text = params.get("text")?.as_str()?.to_string();
+   240→   240→                let kind = params
+   241→   241→                    .get("kind")
+   242→   242→                    .and_then(|k| k.as_str())
+   243→   243→                    .unwrap_or("fact")
+   244→   244→                    .to_string();
+   245→   245→                Some(Tool::MemoryAdd { text, kind })
+   246→   246→            }
+   247→   247→            "memory_search" => {
+   248→   248→                let query = params.get("query")?.as_str()?.to_string();
+   249→   249→                Some(Tool::MemorySearch { query })
+   250→   250→            }
+   251→   251→            "web_search" => {
+   252→   252→                let query = params.get("query")?.as_str()?.to_string();
+   253→   253→                Some(Tool::WebSearch { query })
+   254→   254→            }
+   255→   255→            "plan_create" => {
+   256→   256→                let goal = params.get("goal")?.as_str()?.to_string();
+   257→   257→                let steps = params
+   258→   258→                    .get("steps")
+   259→   259→                    .and_then(|s| s.as_array())
+   260→   260→                    .map(|arr| {
+   261→   261→                        arr.iter()
+   262→   262→                            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+   263→   263→                            .collect::<Vec<_>>()
+   264→   264→                    })
+   265→   265→                    .unwrap_or_default();
+   266→   266→                Some(Tool::PlanCreate { goal, steps })
+   267→   267→            }
+   268→   268→            "plan_update" => {
+   269→   269→                let step_index = params.get("step_index")?.as_u64()? as usize;
+   270→   270→                Some(Tool::PlanUpdate { step_index })
+   271→   271→            }
+   272→   272→            _ => None,
+   273→   273→        }
+   274→   274→    }
+   275→   275→}
+   276→   276→
+   277→   277→// ---------------------------------------------------------------------------
+   278→   278→// ToolSpec — name + description + JSON-Schema parameters
+   279→   279→// ---------------------------------------------------------------------------
+   280→   280→
+   281→   281→/// A tool advertisement: name, description, and a JSON Schema describing
+   282→   282→/// the tool's parameters. Returned by [`ToolRegistry::catalog`] for
+   283→   283→/// injection into the agent system prompt and for the `GET /v1/tools`
+   284→   284→/// introspection endpoint.
+   285→   285→#[derive(Clone, Debug)]
+   286→   286→pub struct ToolSpec {
+   287→   287→    /// Canonical tool name (matches [`Tool::name`]).
+   288→   288→    pub name: &'static str,
+   289→   289→    /// Human-readable description (matches [`Tool::description`]).
+   290→   290→    pub description: &'static str,
+   291→   291→    /// JSON Schema (draft-07 subset) describing the tool's parameters.
+   292→   292→    /// `type: "object"` with `properties` and `required` arrays.
+   293→   293→    pub parameters: Value,
+   294→   294→}
+   295→   295→
+   296→   296→// ---------------------------------------------------------------------------
+   297→   297→// ToolRegistry — catalog + dispatch
+   298→   298→// ---------------------------------------------------------------------------
+   299→   299→
+   300→   300→/// Stateless registry of all tools available to the autonomous agent.
+   301→   301→///
+   302→   302→/// Despite having no fields, this is a struct (not free functions) so that
+   303→   303→/// future evolution (per-agent tool whitelisting, dynamic tool registration,
+   304→   304→/// rate limits, capability scopes, …) has an obvious extension point. Today
+   305→   305→/// every call to [`ToolRegistry::new`] returns an identical catalog.
+   306→   306→///
+   307→   307→/// # Example
+   308→   308→///
+   309→   309→/// ```ignore
+   310→   310→/// use crate::tools::{Tool, ToolRegistry};
+   311→   311→///
+   312→   312→/// let registry = ToolRegistry::new();
+   313→   313→/// let catalog = registry.catalog();
+   314→   314→/// assert_eq!(catalog.len(), 12);
+   315→   315→///
+   316→   316→/// let params = serde_json::json!({ "path": "/etc/hostname" });
+   317→   317→/// let tool = Tool::from_request("file_read", &params).unwrap();
+   318→   318→/// let (output, success) = futures::executor::block_on(registry.execute(&tool));
+   319→   319→/// assert!(success);
+   320→   320→/// ```
+   321→   321→pub struct ToolRegistry;
+   322→   322→
+   323→   323→impl ToolRegistry {
+   324→   324→    /// Construct a new registry. Today this is a no-op (the registry is
+   325→   325→    /// stateless); the constructor exists for future extensibility.
+   326→   326→    pub fn new() -> Self {
+   327→   327→        Self
+   328→   328→    }
+   329→   329→
+   330→   330→    /// Return the full catalog of tools in a stable order. The order is
+   331→   331→    /// preserved across calls so the system prompt and the introspection
+   332→   332→    /// endpoint emit identical tool lists.
+   333→   333→    ///
+   334→   334→    /// The 12 tools cover: file IO (`file_read`, `file_write`, `file_list`,
+   335→   335→    /// `file_delete`), shell (`exec`), window manager (`window_open`,
+   336→   336→    /// `window_close`), memory/Akasha (`memory_add`, `memory_search`),
+   337→   337→    /// external information (`web_search`), and planning (`plan_create`,
+   338→   338→    /// `plan_update`).
+   339→   339→    pub fn catalog(&self) -> Vec<ToolSpec> {
+   340→   340→        vec![
+   341→   341→            ToolSpec {
+   342→   342→                name: "file_read",
+   343→   343→                description: Tool::FileRead { path: String::new() }.description(),
+   344→   344→                parameters: json!({
+   345→   345→                    "type": "object",
+   346→   346→                    "properties": {
+   347→   347→                        "path": {
+   348→   348→                            "type": "string",
+   349→   349→                            "description": "Absolute or relative path of the file to read."
+   350→   350→                        }
+   351→   351→                    },
+   352→   352→                    "required": ["path"]
+   353→   353→                }),
+   354→   354→            },
+   355→   355→            ToolSpec {
+   356→   356→                name: "file_write",
+   357→   357→                description: Tool::FileWrite { path: String::new(), content: String::new() }.description(),
+   358→   358→                parameters: json!({
+   359→   359→                    "type": "object",
+   360→   360→                    "properties": {
+   361→   361→                        "path": {
+   362→   362→                            "type": "string",
+   363→   363→                            "description": "Path of the file to write."
+   364→   364→                        },
+   365→   365→                        "content": {
+   366→   366→                            "type": "string",
+   367→   367→                            "description": "The full text content to write."
+   368→   368→                        }
+   369→   369→                    },
+   370→   370→                    "required": ["path", "content"]
+   371→   371→                }),
+   372→   372→            },
+   373→   373→            ToolSpec {
+   374→   374→                name: "file_list",
+   375→   375→                description: Tool::FileList { path: String::new() }.description(),
+   376→   376→                parameters: json!({
+   377→   377→                    "type": "object",
+   378→   378→                    "properties": {
+   379→   379→                        "path": {
+   380→   380→                            "type": "string",
+   381→   381→                            "description": "Path of the directory to list."
+   382→   382→                        }
+   383→   383→                    },
+   384→   384→                    "required": ["path"]
+   385→   385→                }),
+   386→   386→            },
+   387→   387→            ToolSpec {
+   388→   388→                name: "file_delete",
+   389→   389→                description: Tool::FileDelete { path: String::new() }.description(),
+   390→   390→                parameters: json!({
+   391→   391→                    "type": "object",
+   392→   392→                    "properties": {
+   393→   393→                        "path": {
+   394→   394→                            "type": "string",
+   395→   395→                            "description": "Path of the file or directory to delete."
+   396→   396→                        }
+   397→   397→                    },
+   398→   398→                    "required": ["path"]
+   399→   399→                }),
+   400→   400→            },
+   401→   401→            ToolSpec {
+   402→   402→                name: "exec",
+   403→   403→                description: Tool::Exec { command: String::new() }.description(),
+   404→   404→                parameters: json!({
+   405→   405→                    "type": "object",
+   406→   406→                    "properties": {
+   407→   407→                        "command": {
+   408→   408→                            "type": "string",
+   409→   409→                            "description": "The full shell command line (run via `/bin/bash -c`)."
+   410→   410→                        }
+   411→   411→                    },
+   412→   412→                    "required": ["command"]
+   413→   413→                }),
+   414→   414→            },
+   415→   415→            ToolSpec {
+   416→   416→                name: "window_open",
+   417→   417→                description: Tool::WindowOpen { app: String::new() }.description(),
+   418→   418→                parameters: json!({
+   419→   419→                    "type": "object",
+   420→   420→                    "properties": {
+   421→   421→                        "app": {
+   422→   422→                            "type": "string",
+   423→   423→                            "description": "App identifier (e.g. \"terminal\", \"editor\", \"browser\")."
+   424→   424→                        }
+   425→   425→                    },
+   426→   426→                    "required": ["app"]
+   427→   427→                }),
+   428→   428→            },
+   429→   429→            ToolSpec {
+   430→   430→                name: "window_close",
+   431→   431→                description: Tool::WindowClose { window_id: String::new() }.description(),
+   432→   432→                parameters: json!({
+   433→   433→                    "type": "object",
+   434→   434→                    "properties": {
+   435→   435→                        "window_id": {
+   436→   436→                            "type": "string",
+   437→   437→                            "description": "The id of the window to close."
+   438→   438→                        }
+   439→   439→                    },
+   440→   440→                    "required": ["window_id"]
+   441→   441→                }),
+   442→   442→            },
+   443→   443→            ToolSpec {
+   444→   444→                name: "memory_add",
+   445→   445→                description: Tool::MemoryAdd { text: String::new(), kind: String::new() }.description(),
+   446→   446→                parameters: json!({
+   447→   447→                    "type": "object",
+   448→   448→                    "properties": {
+   449→   449→                        "text": {
+   450→   450→                            "type": "string",
+   451→   451→                            "description": "The memory text to store."
+   452→   452→                        },
+   453→   453→                        "kind": {
+   454→   454→                            "type": "string",
+   455→   455→                            "enum": ["fact", "lesson", "plan", "goal", "intention", "log", "code"],
+   456→   456→                            "description": "Memory kind. Defaults to \"fact\"."
+   457→   457→                        }
+   458→   458→                    },
+   459→   459→                    "required": ["text"]
+   460→   460→                }),
+   461→   461→            },
+   462→   462→            ToolSpec {
+   463→   463→                name: "memory_search",
+   464→   464→                description: Tool::MemorySearch { query: String::new() }.description(),
+   465→   465→                parameters: json!({
+   466→   466→                    "type": "object",
+   467→   467→                    "properties": {
+   468→   468→                        "query": {
+   469→   469→                            "type": "string",
+   470→   470→                            "description": "The free-text query to search memories for."
+   471→   471→                        }
+   472→   472→                    },
+   473→   473→                    "required": ["query"]
+   474→   474→                }),
+   475→   475→            },
+   476→   476→            ToolSpec {
+   477→   477→                name: "web_search",
+   478→   478→                description: Tool::WebSearch { query: String::new() }.description(),
+   479→   479→                parameters: json!({
+   480→   480→                    "type": "object",
+   481→   481→                    "properties": {
+   482→   482→                        "query": {
+   483→   483→                            "type": "string",
+   484→   484→                            "description": "The web search query."
+   485→   485→                        }
+   486→   486→                    },
+   487→   487→                    "required": ["query"]
+   488→   488→                }),
+   489→   489→            },
+   490→   490→            ToolSpec {
+   491→   491→                name: "plan_create",
+   492→   492→                description: Tool::PlanCreate { goal: String::new(), steps: Vec::new() }.description(),
+   493→   493→                parameters: json!({
+   494→   494→                    "type": "object",
+   495→   495→                    "properties": {
+   496→   496→                        "goal": {
+   497→   497→                            "type": "string",
+   498→   498→                            "description": "The high-level goal the plan achieves."
+   499→   499→                        },
+   500→   500→                        "steps": {
+   501→   501→                            "type": "array",
+   502→   502→                            "items": { "type": "string" },
+   503→   503→                            "description": "Ordered list of step descriptions."
+   504→   504→                        }
+   505→   505→                    },
+   506→   506→                    "required": ["goal", "steps"]
+   507→   507→                }),
+   508→   508→            },
+   509→   509→            ToolSpec {
+   510→   510→                name: "plan_update",
+   511→   511→                description: Tool::PlanUpdate { step_index: 0 }.description(),
+   512→   512→                parameters: json!({
+   513→   513→                    "type": "object",
+   514→   514→                    "properties": {
+   515→   515→                        "step_index": {
+   516→   516→                            "type": "integer",
+   517→   517→                            "minimum": 0,
+   518→   518→                            "description": "0-indexed step to mark as done."
+   519→   519→                        }
+   520→   520→                    },
+   521→   521→                    "required": ["step_index"]
+   522→   522→                }),
+   523→   523→            },
+   524→   524→        ]
+   525→   525→    }
+   526→   526→
+   527→   527→    /// Execute a parsed [`Tool`].
+   528→   528→    ///
+   529→   529→    /// Returns `(output, success)` where:
+   530→   530→    /// - `output` is a human/LLM-readable string describing the result,
+   531→   531→    /// - `success` is `true` when the tool "succeeded" (placeholder logic;
+   532→   532→    ///   see the module docs for why real OS integration happens via the
+   533→   533→    ///   Next.js layer).
+   534→   534→    ///
+   535→   535→    /// Placeholder behavior:
+   536→   536→    ///
+   537→   537→    /// - File/shell/window/web tools always succeed and return a canonical
+   538→   538→    ///   `[<tool> placeholder] would <action>: <params>` string. The Next.js
+   539→   539→    ///   layer intercepts these and performs the real side-effect.
+   540→   540→    /// - Memory tools (`memory_add`, `memory_search`) and plan tools
+   541→   541→    ///   (`plan_create`, `plan_update`) also return placeholders — the
+   542→   542→    ///   Next.js layer is responsible for POSTing to `/graph/add` /
+   543→   543→    ///   `/graph/search` and updating the plan store respectively.
+   544→   544→    ///
+   545→   545→    /// This split keeps the tool registry self-contained (no `AppState`
+   546→   546→    /// dependency, no async I/O for files, no PTY plumbing) while still
+   547→   547→    /// exercising the full agent loop end-to-end.
+   548→   548→    pub async fn execute(&self, tool: &Tool) -> (String, bool) {
+   549→   549→        match tool {
+   550→   550→            Tool::FileRead { path } => (
+   551→   551→                format!(
+   552→   552→                    "[file_read placeholder] would read file at \"{path}\" and return its contents."
+   553→   553→                ),
+   554→   554→                true,
+   555→   555→            ),
+   556→   556→            Tool::FileWrite { path, content } => (
+   557→   557→                format!(
+   558→   558→                    "[file_write placeholder] would write {} byte(s) to \"{path}\".",
+   559→   559→                    content.len()
+   560→   560→                ),
+   561→   561→                true,
+   562→   562→            ),
+   563→   563→            Tool::FileList { path } => (
+   564→   564→                format!(
+   565→   565→                    "[file_list placeholder] would list the directory entries of \"{path}\"."
+   566→   566→                ),
+   567→   567→                true,
+   568→   568→            ),
+   569→   569→            Tool::FileDelete { path } => (
+   570→   570→                format!(
+   571→   571→                    "[file_delete placeholder] would delete the file or directory at \"{path}\"."
+   572→   572→                ),
+   573→   573→                true,
+   574→   574→            ),
+   575→   575→            Tool::Exec { command } => (
+   576→   576→                format!(
+   577→   577→                    "[exec placeholder] would run shell command: `{command}`"
+   578→   578→                ),
+   579→   579→                true,
+   580→   580→            ),
+   581→   581→            Tool::WindowOpen { app } => (
+   582→   582→                format!(
+   583→   583→                    "[window_open placeholder] would open the \"{app}\" application window."
+   584→   584→                ),
+   585→   585→                true,
+   586→   586→            ),
+   587→   587→            Tool::WindowClose { window_id } => (
+   588→   588→                format!(
+   589→   589→                    "[window_close placeholder] would close window \"{window_id}\"."
+   590→   590→                ),
+   591→   591→                true,
+   592→   592→            ),
+   593→   593→            Tool::MemoryAdd { text, kind } => (
+   594→   594→                format!(
+   595→   595→                    "[memory_add placeholder] would add a \"{kind}\" memory to Akasha: {}",
+   596→   596→                    truncate(text, 200)
+   597→   597→                ),
+   598→   598→                true,
+   599→   599→            ),
+   600→   600→            Tool::MemorySearch { query } => (
+   601→   601→                format!(
+   602→   602→                    "[memory_search placeholder] would search the semantic memory graph for: {}",
+   603→   603→                    truncate(query, 200)
+   604→   604→                ),
+   605→   605→                true,
+   606→   606→            ),
+   607→   607→            Tool::WebSearch { query } => (
+   608→   608→                format!(
+   609→   609→                    "[web_search placeholder] would search the web for: {}",
+   610→   610→                    truncate(query, 200)
+   611→   611→                ),
+   612→   612→                true,
+   613→   613→            ),
+   614→   614→            Tool::PlanCreate { goal, steps } => (
+   615→   615→                format!(
+   616→   616→                    "[plan_create placeholder] would create a {}-step plan for goal: {}\n  - {}",
+   617→   617→                    steps.len(),
+   618→   618→                    truncate(goal, 200),
+   619→   619→                    steps
+   620→   620→                        .iter()
+   621→   621→                        .map(|s| truncate(s, 100))
+   622→   622→                        .collect::<Vec<_>>()
+   623→   623→                        .join("\n  - ")
+   624→   624→                ),
+   625→   625→                true,
+   626→   626→            ),
+   627→   627→            Tool::PlanUpdate { step_index } => (
+   628→   628→                format!(
+   629→   629→                    "[plan_update placeholder] would mark plan step #{step_index} as done."
+   630→   630→                ),
+   631→   631→                true,
+   632→   632→            ),
+   633→   633→        }
+   634→   634→    }
+   635→   635→}
+   636→   636→
+   637→   637→impl Default for ToolRegistry {
+   638→   638→    /// Default instance with the standard 12-tool catalog.
+   639→   639→    fn default() -> Self {
+   640→   640→        Self::new()
+   641→   641→    }
+   642→   642→}
+   643→   643→
+   644→   644→// ---------------------------------------------------------------------------
+   645→   645→// Private helpers
+   646→   646→// ---------------------------------------------------------------------------
+   647→   647→
+   648→   648→/// Truncate `s` to at most `max` characters, appending an ellipsis when
+   649→   649→/// truncation occurs. Used to keep placeholder tool outputs short enough
+   650→   650→/// to fit comfortably inside the LLM's context window across many
+   651→   651→/// iterations.
+   652→   652→fn truncate(s: &str, max: usize) -> String {
+   653→   653→    if s.chars().count() <= max {
+   654→   654→        s.to_string()
+   655→   655→    } else {
+   656→   656→        let truncated: String = s.chars().take(max).collect();
+   657→   657→        format!("{truncated}…")
+   658→   658→    }
+   659→   659→}
+   660→   660→

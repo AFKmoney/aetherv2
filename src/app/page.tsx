@@ -6,7 +6,8 @@ import {
   ChevronRight, Play, Send, Plus, Trash2, RefreshCw,
   Cpu, HardDrive, Clock, CheckCircle2, XCircle, AlertCircle,
   Sparkles, Flame, Shield, Layers, MessageSquare, Eye,
-  Gauge, ArrowUpRight, Terminal, Box, Radio, Server
+  Gauge, ArrowUpRight, Terminal, Box, Radio, Server,
+  FileBox, Power, PowerOff, Download
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -69,6 +70,17 @@ interface MemoryNodeVis {
   score: number;
 }
 
+interface InferenceStatus {
+  running: boolean;
+  backend: string;
+  model: string | null;
+  modelSize: string;
+  contextSize: number;
+  port: number;
+  availableModels: number;
+  models: Array<{ filename: string; sizeMB: number; detected: boolean }>;
+}
+
 // ═══════════════════════════════════════════
 // Pipeline Stage Definitions
 // ═══════════════════════════════════════════
@@ -105,6 +117,8 @@ export default function AetherOSPage() {
   const [agentResult, setAgentResult] = useState<any>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const [selectedModel, setSelectedModel] = useState('aether-pipeline');
+  const [inferenceStatus, setInferenceStatus] = useState<InferenceStatus | null>(null);
+  const [inferenceLoading, setInferenceLoading] = useState(false);
 
   // Fetch stats
   const fetchStats = useCallback(async () => {
@@ -116,6 +130,22 @@ export default function AetherOSPage() {
       }
     } catch (e) {
       console.error('Stats fetch error:', e);
+    }
+  }, []);
+
+  // Fetch inference status
+  const fetchInference = useCallback(async () => {
+    try {
+      const res = await fetch('/api/inference');
+      if (res.ok) {
+        const data = await res.json();
+        setInferenceStatus({
+          ...data.status,
+          models: data.models || [],
+        });
+      }
+    } catch (e) {
+      console.error('Inference fetch error:', e);
     }
   }, []);
 
@@ -139,10 +169,11 @@ export default function AetherOSPage() {
 
   useEffect(() => {
     fetchStats();
+    fetchInference();
     fetchMemory();
     const interval = setInterval(fetchStats, 5000);
     return () => clearInterval(interval);
-  }, [fetchStats, fetchMemory]);
+  }, [fetchStats, fetchInference, fetchMemory]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -303,6 +334,58 @@ export default function AetherOSPage() {
     }
   };
 
+  // ─── Start Local Model ───
+  const handleStartModel = async (filename?: string) => {
+    setInferenceLoading(true);
+    try {
+      const body: Record<string, string> = { action: 'start' };
+      if (filename) body.modelPath = filename;
+      const res = await fetch('/api/inference', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      fetchInference();
+      return data;
+    } catch (e) {
+      console.error('Start model error:', e);
+    } finally {
+      setInferenceLoading(false);
+    }
+  };
+
+  // ─── Stop Local Model ───
+  const handleStopModel = async () => {
+    setInferenceLoading(true);
+    try {
+      await fetch('/api/inference', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop' }),
+      });
+      fetchInference();
+    } catch (e) {
+      console.error('Stop model error:', e);
+    } finally {
+      setInferenceLoading(false);
+    }
+  };
+
+  // ─── Refresh Models ───
+  const handleRefreshModels = async () => {
+    try {
+      await fetch('/api/inference', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'discover' }),
+      });
+      fetchInference();
+    } catch (e) {
+      console.error('Refresh models error:', e);
+    }
+  };
+
   // ═══════════════════════════════════════════
   // RENDER
   // ═══════════════════════════════════════════
@@ -329,21 +412,21 @@ export default function AetherOSPage() {
           </div>
 
           <div className="flex items-center gap-4">
-            {/* System Status */}
+            {/* Model Status */}
             <div className="hidden sm:flex items-center gap-2 text-xs font-mono text-muted-foreground">
+              <div className="flex items-center gap-1.5">
+                <Cpu className={`w-3 h-3 ${inferenceStatus?.running ? 'text-aether-green' : 'text-aether-red'}`} />
+                <span>{inferenceStatus?.running ? inferenceStatus.model?.substring(0, 25) : 'NO MODEL'}</span>
+              </div>
+              <Separator orientation="vertical" className="h-3" />
               <div className="flex items-center gap-1.5">
                 <Server className="w-3 h-3 text-aether-green" />
                 <span>ONLINE</span>
               </div>
               <Separator orientation="vertical" className="h-3" />
               <div className="flex items-center gap-1.5">
-                <Cpu className="w-3 h-3 text-aether-cyan" />
-                <span>{stats?.graphNodeCount || 0} nodes</span>
-              </div>
-              <Separator orientation="vertical" className="h-3" />
-              <div className="flex items-center gap-1.5">
                 <HardDrive className="w-3 h-3 text-aether-purple" />
-                <span>{stats?.hcm ? `${(stats.hcm.memoryUsageBytes / 1024).toFixed(0)}KB HCM` : '—'}</span>
+                <span>{stats?.graphNodeCount || 0} nodes</span>
               </div>
             </div>
 
@@ -361,13 +444,16 @@ export default function AetherOSPage() {
             <TabsTrigger value="dashboard" className="text-xs data-[state=active]:bg-aether-cyan/10 data-[state=active]:text-aether-cyan">
               <Activity className="w-3.5 h-3.5 mr-1.5" /> Dashboard
             </TabsTrigger>
+            <TabsTrigger value="model" className="text-xs data-[state=active]:bg-aether-green/10 data-[state=active]:text-aether-green">
+              <Cpu className="w-3.5 h-3.5 mr-1.5" /> Model
+            </TabsTrigger>
             <TabsTrigger value="chat" className="text-xs data-[state=active]:bg-aether-purple/10 data-[state=active]:text-aether-purple">
               <MessageSquare className="w-3.5 h-3.5 mr-1.5" /> Chat
             </TabsTrigger>
-            <TabsTrigger value="agent" className="text-xs data-[state=active]:bg-aether-green/10 data-[state=active]:text-aether-green">
+            <TabsTrigger value="agent" className="text-xs data-[state=active]:bg-aether-orange/10 data-[state=active]:text-aether-orange">
               <Bot className="w-3.5 h-3.5 mr-1.5" /> Agent
             </TabsTrigger>
-            <TabsTrigger value="memory" className="text-xs data-[state=active]:bg-aether-orange/10 data-[state=active]:text-aether-orange">
+            <TabsTrigger value="memory" className="text-xs data-[state=active]:bg-aether-pink/10 data-[state=active]:text-aether-pink">
               <Database className="w-3.5 h-3.5 mr-1.5" /> Memory
             </TabsTrigger>
           </TabsList>
@@ -537,6 +623,222 @@ export default function AetherOSPage() {
                 ))}
               </div>
             </Card>
+          </TabsContent>
+
+          {/* ═══ MODEL TAB ═══ */}
+          <TabsContent value="model" className="space-y-4">
+            {/* Model Status Hero */}
+            <Card className="glass-card p-6">
+              <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                <div className="flex items-center gap-4">
+                  <div className={`w-14 h-14 rounded-2xl flex items-center justify-center ${
+                    inferenceStatus?.running
+                      ? 'bg-aether-green/10 border border-aether-green/30'
+                      : 'bg-aether-red/10 border border-aether-red/30'
+                  }`}>
+                    <Cpu className={`w-7 h-7 ${inferenceStatus?.running ? 'text-aether-green' : 'text-aether-red'}`} />
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-bold">
+                      {inferenceStatus?.running ? 'Model Active' : 'No Model Loaded'}
+                    </h2>
+                    <p className="text-xs text-muted-foreground font-mono">
+                      {inferenceStatus?.running
+                        ? `${inferenceStatus.model} (${inferenceStatus.modelSize}) via ${inferenceStatus.backend}`
+                        : 'Drop a GGUF in models/ to power the cognitive pipeline'
+                      }
+                    </p>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  {inferenceStatus?.running ? (
+                    <Button
+                      onClick={handleStopModel}
+                      disabled={inferenceLoading}
+                      size="sm"
+                      className="bg-aether-red/20 text-aether-red hover:bg-aether-red/30 border border-aether-red/30"
+                    >
+                      <PowerOff className="w-3.5 h-3.5 mr-2" /> Stop
+                    </Button>
+                  ) : (
+                    <Button
+                      onClick={() => handleStartModel()}
+                      disabled={inferenceLoading || (inferenceStatus?.availableModels || 0) === 0}
+                      size="sm"
+                      className="bg-aether-green/20 text-aether-green hover:bg-aether-green/30 border border-aether-green/30"
+                    >
+                      <Power className="w-3.5 h-3.5 mr-2" /> Start
+                    </Button>
+                  )}
+                  <Button
+                    onClick={handleRefreshModels}
+                    size="sm"
+                    variant="outline"
+                    className="text-[10px]"
+                  >
+                    <RefreshCw className="w-3 h-3 mr-1" /> Scan
+                  </Button>
+                </div>
+              </div>
+            </Card>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              {/* Available Models */}
+              <Card className="glass-card p-4 lg:col-span-2">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <FileBox className="w-4 h-4 text-aether-cyan" />
+                    <h2 className="text-sm font-semibold">GGUF Models</h2>
+                    <Badge variant="outline" className="text-[10px] font-mono border-aether-cyan/30 text-aether-cyan">
+                      {inferenceStatus?.models?.length || 0} found
+                    </Badge>
+                  </div>
+                </div>
+
+                {(!inferenceStatus?.models || inferenceStatus.models.length === 0) ? (
+                  <div className="flex flex-col items-center justify-center py-12 text-center">
+                    <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-aether-cyan/5 to-aether-purple/5 border border-border/30 flex items-center justify-center mb-4 animate-float">
+                      <Download className="w-8 h-8 text-aether-cyan/50" />
+                    </div>
+                    <h3 className="text-sm font-semibold mb-1">No GGUF Models Found</h3>
+                    <p className="text-xs text-muted-foreground max-w-md mb-4">
+                      Drop a .gguf file in the <code className="text-aether-cyan bg-aether-cyan/10 px-1 rounded">models/</code> directory.
+                      Small models (1-3B params, Q4_K_M quantization) work best with the AetherOS pipeline — that&apos;s the whole point!
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-left max-w-md">
+                      <div className="rounded-lg border border-aether-green/20 bg-aether-green/5 p-2.5">
+                        <p className="text-[10px] font-mono text-aether-green mb-0.5">RECOMMENDED</p>
+                        <p className="text-xs font-semibold">1-3B Q4_K_M</p>
+                        <p className="text-[9px] text-muted-foreground">~700MB-1.8GB</p>
+                      </div>
+                      <div className="rounded-lg border border-aether-yellow/20 bg-aether-yellow/5 p-2.5">
+                        <p className="text-[10px] font-mono text-aether-yellow mb-0.5">GOOD</p>
+                        <p className="text-xs font-semibold">7B Q4_K_M</p>
+                        <p className="text-[9px] text-muted-foreground">~4GB</p>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {inferenceStatus.models.map(model => (
+                      <div
+                        key={model.filename}
+                        className={`flex items-center justify-between rounded-lg border p-3 transition-all ${
+                          inferenceStatus.running && inferenceStatus.model === model.filename
+                            ? 'border-aether-green/40 bg-aether-green/5'
+                            : 'border-border/30 bg-card/30 hover:border-aether-cyan/30'
+                        }`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                            inferenceStatus.running && inferenceStatus.model === model.filename
+                              ? 'bg-aether-green/20'
+                              : 'bg-secondary'
+                          }`}>
+                            <Cpu className={`w-4 h-4 ${
+                              inferenceStatus.running && inferenceStatus.model === model.filename
+                                ? 'text-aether-green'
+                                : 'text-muted-foreground'
+                            }`} />
+                          </div>
+                          <div>
+                            <p className="text-xs font-semibold font-mono">{model.filename}</p>
+                            <p className="text-[10px] text-muted-foreground">{model.sizeMB} MB</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {inferenceStatus.running && inferenceStatus.model === model.filename && (
+                            <Badge className="text-[8px] bg-aether-green/10 text-aether-green border-aether-green/20">
+                              ACTIVE
+                            </Badge>
+                          )}
+                          {model.sizeMB < 2000 && (
+                            <Badge className="text-[8px] bg-aether-cyan/10 text-aether-cyan border-aether-cyan/20">
+                              OPTIMAL
+                            </Badge>
+                          )}
+                          {!inferenceStatus.running && (
+                            <Button
+                              onClick={() => handleStartModel(model.filename)}
+                              size="sm"
+                              variant="outline"
+                              className="text-[10px] border-aether-green/30 text-aether-green hover:bg-aether-green/10 h-7"
+                              disabled={inferenceLoading}
+                            >
+                              <Play className="w-3 h-3 mr-1" /> Load
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Card>
+
+              {/* Engine Config & Info */}
+              <div className="space-y-4">
+                <Card className="glass-card p-4">
+                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">Engine Status</h3>
+                  <div className="space-y-2 text-[10px] font-mono">
+                    <div className="flex justify-between py-1.5 border-b border-border/20">
+                      <span className="text-muted-foreground">Backend</span>
+                      <span className="text-aether-cyan">{inferenceStatus?.backend || 'none'}</span>
+                    </div>
+                    <div className="flex justify-between py-1.5 border-b border-border/20">
+                      <span className="text-muted-foreground">Context</span>
+                      <span className="text-aether-purple">{inferenceStatus?.contextSize || 4096} tokens</span>
+                    </div>
+                    <div className="flex justify-between py-1.5 border-b border-border/20">
+                      <span className="text-muted-foreground">Port</span>
+                      <span className="text-aether-green">{inferenceStatus?.port || 8081}</span>
+                    </div>
+                    <div className="flex justify-between py-1.5">
+                      <span className="text-muted-foreground">Status</span>
+                      <span className={inferenceStatus?.running ? 'text-aether-green' : 'text-aether-red'}>
+                        {inferenceStatus?.running ? 'RUNNING' : 'STOPPED'}
+                      </span>
+                    </div>
+                  </div>
+                </Card>
+
+                <Card className="glass-card p-4">
+                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">The Thesis</h3>
+                  <div className="space-y-2 text-xs text-muted-foreground leading-relaxed">
+                    <p>
+                      A <span className="text-aether-cyan font-semibold">1.2B model</span> with the right scaffolding outperforms a <span className="text-aether-red font-semibold">70B model</span> flying blind.
+                    </p>
+                    <p>
+                      The pipeline <span className="text-aether-green">remembers FOR the model</span>, <span className="text-aether-purple">decomposes FOR the model</span>, and <span className="text-aether-yellow">verifies FOR the model</span>.
+                    </p>
+                    <p className="text-[10px] font-mono text-aether-orange">
+                      L&apos;habit fait le moine.
+                    </p>
+                  </div>
+                </Card>
+
+                <Card className="glass-card p-4">
+                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">Setup Guide</h3>
+                  <div className="space-y-1.5 text-[10px] font-mono">
+                    <div className="flex items-start gap-2 text-muted-foreground">
+                      <span className="text-aether-cyan">1.</span>
+                      <span>Download a GGUF model (HuggingFace)</span>
+                    </div>
+                    <div className="flex items-start gap-2 text-muted-foreground">
+                      <span className="text-aether-cyan">2.</span>
+                      <span>Drop it in <code className="text-aether-cyan">models/</code></span>
+                    </div>
+                    <div className="flex items-start gap-2 text-muted-foreground">
+                      <span className="text-aether-cyan">3.</span>
+                      <span>Install llama.cpp or Ollama</span>
+                    </div>
+                    <div className="flex items-start gap-2 text-muted-foreground">
+                      <span className="text-aether-cyan">4.</span>
+                      <span>Click Start — pipeline does the rest</span>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+            </div>
           </TabsContent>
 
           {/* ═══ CHAT TAB ═══ */}

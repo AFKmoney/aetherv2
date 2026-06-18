@@ -1,8 +1,10 @@
-# ⚡ AetherOS v2 — Unified AI Orchestration Engine
+# ⚡ AetherOS v2 — Local AI Orchestration Engine
 
 > *"L'habit fait le moine"* — The outfit makes the monk. A 1.2B model with the right scaffolding outperforms a 70B model flying blind.
 
-AetherOS is a **cognitive middleware** that makes small AI models act like super agents through a 10-stage pipeline. Inspired by [aether-engine](https://github.com/AFKmoney/aether-engine), rebuilt as a full-stack TypeScript platform with real-time visualization.
+**100% local. Zero cloud. Zero API keys.** Drop a GGUF in `models/`, start the app, and the cognitive pipeline transforms your small model into an AGI-grade agent.
+
+AetherOS is a **cognitive framework** that makes small local AI models act like super agents through a 10-stage pipeline. Inspired by [aether-engine](https://github.com/AFKmoney/aether-engine), rebuilt as a full-stack TypeScript platform with real-time visualization.
 
 ## 🧠 Core Thesis
 
@@ -112,6 +114,9 @@ src/
 git clone https://github.com/AFKmoney/aetherv2.git
 cd aetherv2
 
+# Drop your GGUF model
+cp ~/Downloads/your-model-Q4_K_M.gguf models/
+
 # Install
 npm install
 
@@ -121,6 +126,16 @@ npm run dev
 # Open
 http://localhost:3000
 ```
+
+### Inference Backends (pick one)
+
+AetherOS needs a local GGUF inference server. It auto-detects:
+
+1. **llama.cpp** (recommended) — copy `llama-server` binary to `bin/`
+2. **Ollama** — install and run `ollama serve`
+3. **Any OpenAI-compatible server** running on port 8081
+
+The app auto-starts the backend when you click "Start" in the Model tab.
 
 ## 🔧 API Reference
 
@@ -132,6 +147,8 @@ http://localhost:3000
 | `GET`  | `/api/graph` | Get full graph for visualization |
 | `GET`  | `/api/stats` | Pipeline telemetry & system stats |
 | `GET`  | `/api/models` | Available model fleet |
+| `GET`  | `/api/inference` | Local GGUF model status |
+| `POST` | `/api/inference` | Start/stop/discover local models |
 
 ## 🎯 The "Super Agent Outfit" Pattern
 

@@ -2,6 +2,8 @@
 // The cognitive engine that makes small models act like super agents
 
 export { AetherPipeline, PIPELINE_STAGES } from './pipeline';
+export { LocalInferenceEngine } from './inference';
+export { inferenceEngine, pipeline } from './instance';
 export { SemanticMemoryGraph } from './graph';
 export { TfidfVectorizer } from './tfidf';
 export { compress } from './compress';

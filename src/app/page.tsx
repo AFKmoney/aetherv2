@@ -2,72 +2,62 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  Zap, Brain, Search, GitBranch, Bot, Activity, Database,
-  ChevronRight, Play, Send, Plus, Trash2, RefreshCw,
-  Cpu, HardDrive, Clock, CheckCircle2, XCircle, AlertCircle,
-  Sparkles, Flame, Shield, Layers, MessageSquare, Eye,
-  Gauge, ArrowUpRight, Terminal, Box, Radio, Server,
-  FileBox, Power, PowerOff, Download
+  Plus, Send, MessageSquare, Settings, Trash2, ChevronDown, ChevronRight,
+  Copy, Check, FolderOpen, FileText, Folder, File, Upload, X,
+  Zap, Brain, GitBranch, Shield, Database, Sparkles, Terminal,
+  Flame, Layers, Radio, Cpu, RotateCcw, PanelRightOpen, PanelRightClose,
+  Edit3, Download, Search
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
-import { Textarea } from '@/components/ui/textarea';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Progress } from '@/components/ui/progress';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { VirtualFileSystem, VFSNode, VFSFile } from '@/lib/engine/vfs';
 
 // ═══════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════
 
-type PipelineStageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
-
-interface PipelineStageData {
+interface Conversation {
   id: string;
-  label: string;
-  description: string;
-  icon: string;
-  status: PipelineStageStatus;
-  durationMs: number;
-  detail: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  updatedAt: number;
 }
 
-interface ChatMsg {
-  role: 'user' | 'assistant' | 'system';
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
   content: string;
-  complexity?: string;
-  model?: string;
-  latencyMs?: number;
-  cacheHit?: boolean;
-  atdPassed?: boolean;
-  pipelineStages?: PipelineStageData[];
+  thinking?: ThinkingBlock[];
+  pipelineInfo?: PipelineInfo;
   timestamp: number;
 }
 
-interface Stats {
-  totalRequests: number;
-  cacheHits: number;
-  cacheHitRate: number;
-  simpleCount: number;
-  moderateCount: number;
-  complexCount: number;
-  atdPassRate: number;
-  avgLatencyMs: number;
-  distillationHits: number;
-  graphNodeCount: number;
-  graphEdgeCount: number;
-  hcm: { dimension: number; pairCount: number; interference: number; memoryUsageBytes: number };
-  models: Array<{ id: string; name: string; provider: string; type: string; capabilities: string[] }>;
+interface ThinkingBlock {
+  label: string;
+  content: string;
+  durationMs: number;
+  status: 'pass' | 'fail' | 'info';
 }
 
-interface MemoryNodeVis {
+interface PipelineInfo {
+  complexity: string;
+  model: string;
+  latencyMs: number;
+  cacheHit: boolean;
+  atdPassed: boolean;
+  stages: StageInfo[];
+}
+
+interface StageInfo {
   id: string;
-  text: string;
-  category: string;
-  score: number;
+  label: string;
+  durationMs: number;
+  status: string;
+  detail: string;
 }
 
 interface InferenceStatus {
@@ -81,309 +71,277 @@ interface InferenceStatus {
   models: Array<{ filename: string; sizeMB: number; detected: boolean }>;
 }
 
-// ═══════════════════════════════════════════
-// Pipeline Stage Definitions
-// ═══════════════════════════════════════════
-
-const STAGES: Array<{ id: string; label: string; desc: string; icon: React.ReactNode; color: string }> = [
-  { id: 'cache_check', label: 'Cache Check', desc: 'O(1) hash + semantic scan', icon: <Zap className="w-4 h-4" />, color: '#eab308' },
-  { id: 'graph_retrieval', label: 'Graph Retrieval', desc: 'TF-IDF + 1-hop expansion', icon: <GitBranch className="w-4 h-4" />, color: '#00f0ff' },
-  { id: 'context_compression', label: 'Compression', desc: '40K → 4K pipeline', icon: <Layers className="w-4 h-4" />, color: '#a855f7' },
-  { id: 'complexity_analysis', label: 'Complexity', desc: 'Rule-based classifier', icon: <Brain className="w-4 h-4" />, color: '#ec4899' },
-  { id: 'decomposition', label: 'Decomposition', desc: '4 strategies + distillation', icon: <Sparkles className="w-4 h-4" />, color: '#f97316' },
-  { id: 'solve', label: 'Solve', desc: 'Sequential sub-question solving', icon: <Terminal className="w-4 h-4" />, color: '#22c55e' },
-  { id: 'synthesis', label: 'Synthesis', desc: 'Combine sub-answers', icon: <Flame className="w-4 h-4" />, color: '#06b6d4' },
-  { id: 'atd_verification', label: 'ATD Verify', desc: 'Likelihood vs entropy', icon: <Shield className="w-4 h-4" />, color: '#ef4444' },
-  { id: 'distillation', label: 'Distill', desc: 'Store successful patterns', icon: <Database className="w-4 h-4" />, color: '#8b5cf6' },
-  { id: 'speculative_prefetch', label: 'Prefetch', desc: 'Warm related caches', icon: <Radio className="w-4 h-4" />, color: '#14b8a6' },
+// Pipeline stage metadata
+const STAGES: Array<{ id: string; label: string; desc: string; color: string }> = [
+  { id: 'cache_check', label: 'Cache', desc: 'O(1) hash + semantic scan', color: '#eab308' },
+  { id: 'graph_retrieval', label: 'Graph', desc: 'TF-IDF + 1-hop expansion', color: '#00f0ff' },
+  { id: 'context_compression', label: 'Compress', desc: '40K → 4K pipeline', color: '#a855f7' },
+  { id: 'complexity_analysis', label: 'Complexity', desc: 'Rule-based classifier', color: '#ec4899' },
+  { id: 'decomposition', label: 'Decompose', desc: '4 strategies + distillation', color: '#f97316' },
+  { id: 'solve', label: 'Solve', desc: 'Sequential sub-question solving', color: '#22c55e' },
+  { id: 'synthesis', label: 'Synthesis', desc: 'Combine sub-answers', color: '#06b6d4' },
+  { id: 'atd_verification', label: 'ATD', desc: 'Likelihood vs entropy', color: '#ef4444' },
+  { id: 'distillation', label: 'Distill', desc: 'Store successful patterns', color: '#8b5cf6' },
+  { id: 'speculative_prefetch', label: 'Prefetch', desc: 'Warm related caches', color: '#14b8a6' },
 ];
 
 // ═══════════════════════════════════════════
-// Main Page Component
+// Main App — Z.ai Clone
 // ═══════════════════════════════════════════
 
 export default function AetherOSPage() {
-  const [activeTab, setActiveTab] = useState('dashboard');
-  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
-  const [chatInput, setChatInput] = useState('');
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [pipelineStages, setPipelineStages] = useState<PipelineStageData[]>(
-    STAGES.map(s => ({ ...s, status: 'pending' as PipelineStageStatus, durationMs: 0, detail: '' }))
-  );
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [memoryNodes, setMemoryNodes] = useState<MemoryNodeVis[]>([]);
-  const [agentGoal, setAgentGoal] = useState('');
-  const [agentRunning, setAgentRunning] = useState(false);
-  const [agentResult, setAgentResult] = useState<any>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
-  const [selectedModel, setSelectedModel] = useState('aether-pipeline');
+  // ─── State ───
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
+  const [inputValue, setInputValue] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [vfs] = useState(() => new VirtualFileSystem());
+  const [showVFS, setShowVFS] = useState(false);
+  const [vfsTree, setVfsTree] = useState<VFSNode | null>(null);
+  const [selectedFile, setSelectedFile] = useState<VFSFile | null>(null);
+  const [editingFile, setEditingFile] = useState<VFSFile | null>(null);
+  const [editContent, setEditContent] = useState('');
   const [inferenceStatus, setInferenceStatus] = useState<InferenceStatus | null>(null);
-  const [inferenceLoading, setInferenceLoading] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [expandedThinking, setExpandedThinking] = useState<Set<string>>(new Set());
+  const [expandedPipeline, setExpandedPipeline] = useState<Set<string>>(new Set());
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [vfsSearchQuery, setVfsSearchQuery] = useState('');
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Fetch stats
-  const fetchStats = useCallback(async () => {
+  // Active conversation
+  const activeConvo = conversations.find(c => c.id === activeConvoId);
+
+  // ─── Load from localStorage ───
+  useEffect(() => {
     try {
-      const res = await fetch('/api/stats');
-      if (res.ok) {
-        const data = await res.json();
-        setStats(data);
-      }
-    } catch (e) {
-      console.error('Stats fetch error:', e);
-    }
+      const saved = localStorage.getItem('aetheros-conversations');
+      if (saved) setConversations(JSON.parse(saved));
+    } catch {}
+    // Load inference status
+    fetchInference();
   }, []);
 
-  // Fetch inference status
+  // ─── Save to localStorage ───
+  useEffect(() => {
+    localStorage.setItem('aetheros-conversations', JSON.stringify(conversations));
+  }, [conversations]);
+
+  // ─── Auto-scroll ───
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [activeConvo?.messages?.length]);
+
+  // ─── VFS tree ───
+  useEffect(() => {
+    const update = () => setVfsTree(vfs.getTree());
+    update();
+    return vfs.onChange(update);
+  }, [vfs]);
+
+  // ─── Inference status ───
   const fetchInference = useCallback(async () => {
     try {
       const res = await fetch('/api/inference');
       if (res.ok) {
         const data = await res.json();
-        setInferenceStatus({
-          ...data.status,
-          models: data.models || [],
-        });
+        setInferenceStatus({ ...data.status, models: data.models || [] });
       }
-    } catch (e) {
-      console.error('Inference fetch error:', e);
-    }
+    } catch {}
   }, []);
 
-  // Fetch memory graph
-  const fetchMemory = useCallback(async () => {
-    try {
-      const res = await fetch('/api/graph');
-      if (res.ok) {
-        const data = await res.json();
-        setMemoryNodes(data.nodes?.map((n: any) => ({
-          id: n.id,
-          text: n.text?.substring(0, 100) || '',
-          category: n.category || 'fact',
-          score: n.score || 0,
-        })) || []);
-      }
-    } catch (e) {
-      console.error('Memory fetch error:', e);
+  // ─── New conversation ───
+  const handleNewChat = () => {
+    const convo: Conversation = {
+      id: `conv_${Date.now()}`,
+      title: 'New conversation',
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setConversations(prev => [convo, ...prev]);
+    setActiveConvoId(convo.id);
+    setInputValue('');
+    inputRef.current?.focus();
+  };
+
+  // ─── Delete conversation ───
+  const handleDeleteConvo = (id: string) => {
+    setConversations(prev => prev.filter(c => c.id !== id));
+    if (activeConvoId === id) setActiveConvoId(null);
+  };
+
+  // ─── Send message ───
+  const handleSend = async () => {
+    if (!inputValue.trim() || isGenerating) return;
+
+    let convoId = activeConvoId;
+    let convo = conversations.find(c => c.id === convoId);
+
+    // Create new conversation if needed
+    if (!convo) {
+      convo = {
+        id: `conv_${Date.now()}`,
+        title: inputValue.trim().substring(0, 50),
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      convoId = convo.id;
+      setConversations(prev => [convo!, ...prev]);
+      setActiveConvoId(convoId);
     }
-  }, []);
 
-  useEffect(() => {
-    fetchStats();
-    fetchInference();
-    fetchMemory();
-    const interval = setInterval(fetchStats, 5000);
-    return () => clearInterval(interval);
-  }, [fetchStats, fetchInference, fetchMemory]);
-
-  // Auto-scroll chat
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages]);
-
-  // ─── Chat Submit ───
-  const handleChatSubmit = async () => {
-    if (!chatInput.trim() || isProcessing) return;
-
-    const userMsg: ChatMsg = {
+    const userMsg: ChatMessage = {
+      id: `msg_${Date.now()}_user`,
       role: 'user',
-      content: chatInput.trim(),
+      content: inputValue.trim(),
       timestamp: Date.now(),
     };
 
-    setChatMessages(prev => [...prev, userMsg]);
-    setChatInput('');
-    setIsProcessing(true);
+    // Update title if first message
+    const isFirst = convo.messages.length === 0;
 
-    // Reset pipeline stages
-    setPipelineStages(STAGES.map(s => ({ ...s, status: 'pending' as PipelineStageStatus, durationMs: 0, detail: '' })));
+    setConversations(prev => prev.map(c =>
+      c.id === convoId
+        ? {
+            ...c,
+            title: isFirst ? inputValue.trim().substring(0, 50) : c.title,
+            messages: [...c.messages, userMsg],
+            updatedAt: Date.now(),
+          }
+        : c
+    ));
+
+    setInputValue('');
+    setIsGenerating(true);
 
     try {
-      // Simulate progressive pipeline stages
-      const simulatedStages = STAGES.map(s => ({ ...s, status: 'pending' as PipelineStageStatus, durationMs: 0, detail: '' }));
-      setPipelineStages([...simulatedStages]);
-
-      // Animate stages one by one
-      for (let i = 0; i < STAGES.length; i++) {
-        simulatedStages[i].status = 'running';
-        setPipelineStages([...simulatedStages]);
-
-        await new Promise(r => setTimeout(r, 150 + Math.random() * 200));
-
-        simulatedStages[i].status = 'completed';
-        simulatedStages[i].durationMs = Math.floor(50 + Math.random() * 200);
-        simulatedStages[i].detail = getStageDetail(STAGES[i].id, chatInput);
-        setPipelineStages([...simulatedStages]);
-      }
-
-      // Call the API
+      // Call the pipeline API
+      const allMessages = [...(convo.messages || []), userMsg];
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: [...chatMessages, userMsg].map(m => ({ role: m.role, content: m.content })),
-          model: selectedModel,
+          messages: allMessages.map(m => ({ role: m.role, content: m.content })),
           temperature: 0.7,
         }),
       });
 
       if (res.ok) {
         const data = await res.json();
-        const aetherData = data.aether || {};
+        const aether = data.aether || {};
 
-        // Update pipeline stages with real data if available
-        if (aetherData.pipelineStages) {
-          setPipelineStages(
-            STAGES.map((s, idx) => {
-              const real = aetherData.pipelineStages?.find((ps: any) => ps.stage === s.id);
-              return real
-                ? { ...s, status: real.status, durationMs: real.durationMs, detail: real.detail }
-                : { ...s, status: 'completed', durationMs: simulatedStages[idx].durationMs, detail: simulatedStages[idx].detail };
-            })
-          );
-        }
+        // Build thinking blocks from pipeline stages
+        const thinking: ThinkingBlock[] = (aether.pipelineStages || [])
+          .filter((s: any) => s.status === 'completed' && s.detail)
+          .map((s: any) => ({
+            label: STAGES.find(st => st.id === s.stage)?.label || s.stage,
+            content: s.detail,
+            durationMs: s.durationMs,
+            status: s.detail.toLowerCase().includes('pass') || s.detail.toLowerCase().includes('hit')
+              ? 'pass' as const
+              : s.detail.toLowerCase().includes('fail')
+                ? 'fail' as const
+                : 'info' as const,
+          }));
 
-        const assistantMsg: ChatMsg = {
+        const assistantMsg: ChatMessage = {
+          id: `msg_${Date.now()}_asst`,
           role: 'assistant',
           content: data.choices?.[0]?.message?.content || 'No response',
-          complexity: aetherData.complexity,
-          model: data.model,
-          latencyMs: aetherData.totalLatencyMs,
-          cacheHit: aetherData.cacheHit,
-          atdPassed: aetherData.atdPassed,
-          pipelineStages: aetherData.pipelineStages,
+          thinking: thinking.length > 0 ? thinking : undefined,
+          pipelineInfo: {
+            complexity: aether.complexity || 'simple',
+            model: data.model || 'aether-pipeline',
+            latencyMs: aether.totalLatencyMs || 0,
+            cacheHit: aether.cacheHit || false,
+            atdPassed: aether.atdPassed || false,
+            stages: (aether.pipelineStages || []).map((s: any) => ({
+              id: s.stage,
+              label: STAGES.find(st => st.id === s.stage)?.label || s.stage,
+              durationMs: s.durationMs,
+              status: s.status,
+              detail: s.detail,
+            })),
+          },
           timestamp: Date.now(),
         };
 
-        setChatMessages(prev => [...prev, assistantMsg]);
+        setConversations(prev => prev.map(c =>
+          c.id === convoId
+            ? { ...c, messages: [...c.messages, assistantMsg], updatedAt: Date.now() }
+            : c
+        ));
       }
     } catch (error) {
       console.error('Chat error:', error);
-      setChatMessages(prev => [...prev, {
-        role: 'assistant',
-        content: 'Error: Failed to get response from the pipeline.',
-        timestamp: Date.now(),
-      }]);
     } finally {
-      setIsProcessing(false);
-      fetchStats();
-      fetchMemory();
+      setIsGenerating(false);
+      fetchInference();
     }
   };
 
-  // ─── Agent Run ───
-  const handleAgentRun = async () => {
-    if (!agentGoal.trim() || agentRunning) return;
-    setAgentRunning(true);
-    setAgentResult(null);
-
-    try {
-      const res = await fetch('/api/agent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          goal: agentGoal,
-          maxIterations: 5,
-          context: { windows: [], memory: [] },
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setAgentResult(data);
+  // ─── VFS operations ───
+  const handleFileUpload = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.onchange = async (e) => {
+      const files = (e.target as HTMLInputElement).files;
+      if (!files) return;
+      for (const file of Array.from(files)) {
+        const content = await file.text();
+        vfs.writeFile(`/workspace/${file.name}`, content, file.type);
       }
-    } catch (error) {
-      console.error('Agent error:', error);
-      setAgentResult({ error: 'Agent run failed' });
-    } finally {
-      setAgentRunning(false);
-      fetchStats();
-      fetchMemory();
-    }
+    };
+    input.click();
   };
 
-  // ─── Add Memory ───
-  const handleAddMemory = async () => {
-    const text = prompt('Enter memory text:');
-    if (!text) return;
-
-    try {
-      await fetch('/api/graph', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'add', text, category: 'fact' }),
-      });
-      fetchMemory();
-      fetchStats();
-    } catch (e) {
-      console.error('Add memory error:', e);
-    }
+  const handleNewFile = () => {
+    const name = prompt('File name:', 'untitled.txt');
+    if (!name) return;
+    const file = vfs.writeFile(`/workspace/${name}`, '');
+    setSelectedFile(file);
+    setEditingFile(file);
+    setEditContent('');
   };
 
-  // ─── Clear Memory ───
-  const handleClearMemory = async () => {
-    try {
-      await fetch('/api/graph', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'clear' }),
-      });
-      fetchMemory();
-      fetchStats();
-    } catch (e) {
-      console.error('Clear memory error:', e);
-    }
+  const handleSaveFile = () => {
+    if (!editingFile) return;
+    vfs.writeFile(editingFile.path, editContent, editingFile.mimeType);
+    setEditingFile(null);
   };
 
-  // ─── Start Local Model ───
-  const handleStartModel = async (filename?: string) => {
-    setInferenceLoading(true);
-    try {
-      const body: Record<string, string> = { action: 'start' };
-      if (filename) body.modelPath = filename;
-      const res = await fetch('/api/inference', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      fetchInference();
-      return data;
-    } catch (e) {
-      console.error('Start model error:', e);
-    } finally {
-      setInferenceLoading(false);
-    }
+  const handleDeleteVFSFile = (path: string) => {
+    vfs.deleteFile(path);
+    if (selectedFile?.path === path) setSelectedFile(null);
+    if (editingFile?.path === path) setEditingFile(null);
   };
 
-  // ─── Stop Local Model ───
-  const handleStopModel = async () => {
-    setInferenceLoading(true);
-    try {
-      await fetch('/api/inference', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'stop' }),
-      });
-      fetchInference();
-    } catch (e) {
-      console.error('Stop model error:', e);
-    } finally {
-      setInferenceLoading(false);
-    }
+  // ─── Copy ───
+  const handleCopy = (text: string, id: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 2000);
   };
 
-  // ─── Refresh Models ───
-  const handleRefreshModels = async () => {
-    try {
-      await fetch('/api/inference', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'discover' }),
-      });
-      fetchInference();
-    } catch (e) {
-      console.error('Refresh models error:', e);
-    }
+  // ─── Toggle thinking/pipeline ───
+  const toggleThinking = (msgId: string) => {
+    setExpandedThinking(prev => {
+      const next = new Set(prev);
+      next.has(msgId) ? next.delete(msgId) : next.add(msgId);
+      return next;
+    });
+  };
+
+  const togglePipeline = (msgId: string) => {
+    setExpandedPipeline(prev => {
+      const next = new Set(prev);
+      next.has(msgId) ? next.delete(msgId) : next.add(msgId);
+      return next;
+    });
   };
 
   // ═══════════════════════════════════════════
@@ -391,1000 +349,634 @@ export default function AetherOSPage() {
   // ═══════════════════════════════════════════
 
   return (
-    <div className="min-h-screen flex flex-col bg-background grid-bg">
-      {/* ─── Header ─── */}
-      <header className="sticky top-0 z-50 border-b border-border/50 bg-background/80 backdrop-blur-xl">
-        <div className="max-w-[1800px] mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="relative">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-aether-cyan to-aether-purple flex items-center justify-center">
-                <Zap className="w-5 h-5 text-black" />
+    <div className="h-screen flex bg-[#0a0a0f] text-[#e4e4ef] overflow-hidden">
+      {/* ═══ SIDEBAR ═══ */}
+      {sidebarOpen && (
+        <div className="w-[260px] flex-shrink-0 flex flex-col border-r border-white/[0.06] bg-[#0d0d14]">
+          {/* Sidebar header */}
+          <div className="p-3 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[#00f0ff] to-[#a855f7] flex items-center justify-center">
+                <Zap className="w-4 h-4 text-black" />
               </div>
-              <div className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-aether-green rounded-full animate-pulse-glow" />
+              <span className="text-sm font-bold tracking-tight">
+                <span className="text-[#00f0ff]">Aether</span>OS
+              </span>
             </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight">
-                <span className="neon-text text-aether-cyan">Aether</span>
-                <span className="text-foreground">OS</span>
-              </h1>
-              <p className="text-[10px] text-muted-foreground -mt-0.5 font-mono">UNIFIED AI ORCHESTRATION</p>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              className="p-1 rounded-md hover:bg-white/5 text-[#71717a] hover:text-[#e4e4ef] transition-colors"
+            >
+              <PanelRightClose className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* New chat */}
+          <div className="px-3 pb-2">
+            <button
+              onClick={handleNewChat}
+              className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-white/[0.08] hover:bg-white/[0.04] transition-colors text-sm"
+            >
+              <Plus className="w-4 h-4" />
+              New conversation
+            </button>
+          </div>
+
+          {/* Model indicator */}
+          <div className="px-3 pb-2">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.02] text-[10px] font-mono text-[#71717a]">
+              <Cpu className={`w-3 h-3 ${inferenceStatus?.running ? 'text-[#22c55e]' : 'text-[#ef4444]'}`} />
+              {inferenceStatus?.running
+                ? inferenceStatus.model?.substring(0, 20)
+                : 'No model loaded'}
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
-            {/* Model Status */}
-            <div className="hidden sm:flex items-center gap-2 text-xs font-mono text-muted-foreground">
-              <div className="flex items-center gap-1.5">
-                <Cpu className={`w-3 h-3 ${inferenceStatus?.running ? 'text-aether-green' : 'text-aether-red'}`} />
-                <span>{inferenceStatus?.running ? inferenceStatus.model?.substring(0, 25) : 'NO MODEL'}</span>
-              </div>
-              <Separator orientation="vertical" className="h-3" />
-              <div className="flex items-center gap-1.5">
-                <Server className="w-3 h-3 text-aether-green" />
-                <span>ONLINE</span>
-              </div>
-              <Separator orientation="vertical" className="h-3" />
-              <div className="flex items-center gap-1.5">
-                <HardDrive className="w-3 h-3 text-aether-purple" />
-                <span>{stats?.graphNodeCount || 0} nodes</span>
-              </div>
-            </div>
+          <Separator className="bg-white/[0.04]" />
 
-            <Badge variant="outline" className="border-aether-cyan/30 text-aether-cyan text-[10px] font-mono">
-              v1.0.0
-            </Badge>
+          {/* Conversations list */}
+          <ScrollArea className="flex-1 px-2 py-1">
+            <div className="space-y-0.5">
+              {conversations.map(convo => (
+                <div
+                  key={convo.id}
+                  className={`group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-colors ${
+                    activeConvoId === convo.id
+                      ? 'bg-white/[0.06] text-[#e4e4ef]'
+                      : 'text-[#71717a] hover:bg-white/[0.03] hover:text-[#e4e4ef]'
+                  }`}
+                  onClick={() => setActiveConvoId(convo.id)}
+                >
+                  <MessageSquare className="w-3.5 h-3.5 flex-shrink-0" />
+                  <span className="text-xs truncate flex-1">{convo.title}</span>
+                  <button
+                    onClick={e => { e.stopPropagation(); handleDeleteConvo(convo.id); }}
+                    className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-[#ef4444] transition-all"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </ScrollArea>
+
+          {/* Sidebar footer */}
+          <div className="p-3 border-t border-white/[0.04]">
+            <div className="flex items-center justify-between">
+              <button
+                onClick={() => setShowVFS(!showVFS)}
+                className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded-md transition-colors ${
+                  showVFS ? 'bg-[#a855f7]/10 text-[#a855f7]' : 'text-[#71717a] hover:text-[#e4e4ef]'
+                }`}
+              >
+                <FolderOpen className="w-3 h-3" /> VFS
+              </button>
+              <span className="text-[9px] font-mono text-[#333]">aetherv2</span>
+            </div>
           </div>
         </div>
-      </header>
+      )}
 
-      {/* ─── Main Content ─── */}
-      <main className="flex-1 max-w-[1800px] w-full mx-auto px-4 py-4">
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="h-full">
-          <TabsList className="bg-card border border-border/50 mb-4">
-            <TabsTrigger value="dashboard" className="text-xs data-[state=active]:bg-aether-cyan/10 data-[state=active]:text-aether-cyan">
-              <Activity className="w-3.5 h-3.5 mr-1.5" /> Dashboard
-            </TabsTrigger>
-            <TabsTrigger value="model" className="text-xs data-[state=active]:bg-aether-green/10 data-[state=active]:text-aether-green">
-              <Cpu className="w-3.5 h-3.5 mr-1.5" /> Model
-            </TabsTrigger>
-            <TabsTrigger value="chat" className="text-xs data-[state=active]:bg-aether-purple/10 data-[state=active]:text-aether-purple">
-              <MessageSquare className="w-3.5 h-3.5 mr-1.5" /> Chat
-            </TabsTrigger>
-            <TabsTrigger value="agent" className="text-xs data-[state=active]:bg-aether-orange/10 data-[state=active]:text-aether-orange">
-              <Bot className="w-3.5 h-3.5 mr-1.5" /> Agent
-            </TabsTrigger>
-            <TabsTrigger value="memory" className="text-xs data-[state=active]:bg-aether-pink/10 data-[state=active]:text-aether-pink">
-              <Database className="w-3.5 h-3.5 mr-1.5" /> Memory
-            </TabsTrigger>
-          </TabsList>
+      {/* ═══ MAIN AREA ═══ */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Top bar */}
+        <div className="h-12 flex items-center justify-between px-4 border-b border-white/[0.04]">
+          <div className="flex items-center gap-3">
+            {!sidebarOpen && (
+              <button
+                onClick={() => setSidebarOpen(true)}
+                className="p-1.5 rounded-md hover:bg-white/5 text-[#71717a] hover:text-[#e4e4ef] transition-colors"
+              >
+                <PanelRightOpen className="w-4 h-4" />
+              </button>
+            )}
+            <span className="text-sm font-medium truncate">
+              {activeConvo?.title || 'AetherOS'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            {activeConvo && (
+              <>
+                <Badge className={`text-[8px] font-mono ${
+                  activeConvo.messages.length > 0 && activeConvo.messages[activeConvo.messages.length - 1].pipelineInfo?.complexity === 'complex'
+                    ? 'bg-[#ef4444]/10 text-[#ef4444]'
+                    : activeConvo.messages.length > 0 && activeConvo.messages[activeConvo.messages.length - 1].pipelineInfo?.complexity === 'moderate'
+                      ? 'bg-[#eab308]/10 text-[#eab308]'
+                      : 'bg-[#22c55e]/10 text-[#22c55e]'
+                }`}>
+                  {activeConvo.messages.length > 0 ? activeConvo.messages[activeConvo.messages.length - 1].pipelineInfo?.complexity || 'ready' : 'ready'}
+                </Badge>
+                <button
+                  onClick={() => { /* regenerate */ }}
+                  className="p-1.5 rounded-md hover:bg-white/5 text-[#71717a] hover:text-[#e4e4ef] transition-colors"
+                  disabled={isGenerating}
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
 
-          {/* ═══ DASHBOARD TAB ═══ */}
-          <TabsContent value="dashboard" className="space-y-4">
-            <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-              {/* Pipeline Visualization — takes 3 columns */}
-              <div className="lg:col-span-3">
-                <Card className="glass-card p-4">
-                  <div className="flex items-center justify-between mb-4">
-                    <div className="flex items-center gap-2">
-                      <Flame className="w-4 h-4 text-aether-cyan" />
-                      <h2 className="text-sm font-semibold">Cognitive Pipeline</h2>
-                      <span className="text-[10px] font-mono text-muted-foreground">10-STAGE</span>
-                    </div>
-                    <Badge variant="outline" className="text-[10px] font-mono border-aether-cyan/30 text-aether-cyan">
-                      {pipelineStages.filter(s => s.status === 'completed').length}/10
-                    </Badge>
-                  </div>
-
-                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                    {pipelineStages.map((stage, idx) => (
-                      <div
-                        key={stage.id}
-                        className={`
-                          relative rounded-lg border p-2.5 transition-all duration-300
-                          ${stage.status === 'running' ? 'stage-running border-aether-cyan/50 bg-aether-cyan/5' : ''}
-                          ${stage.status === 'completed' ? 'stage-completed border-aether-green/30 bg-aether-green/5' : ''}
-                          ${stage.status === 'failed' ? 'stage-failed border-aether-red/30 bg-aether-red/5' : ''}
-                          ${stage.status === 'pending' ? 'border-border/30 bg-card/30' : ''}
-                          ${stage.status === 'skipped' ? 'border-border/20 bg-card/10 opacity-40' : ''}
-                        `}
-                      >
-                        <div className="flex items-center gap-1.5 mb-1">
-                          <div style={{ color: STAGES[idx].color }} className="flex-shrink-0">
-                            {STAGES[idx].icon}
-                          </div>
-                          <span className="text-[10px] font-semibold truncate">{stage.label}</span>
-                        </div>
-                        <p className="text-[9px] text-muted-foreground leading-tight mb-1">{stage.desc}</p>
-                        {stage.status === 'completed' && stage.durationMs > 0 && (
-                          <p className="text-[9px] font-mono text-aether-green">{stage.durationMs}ms</p>
-                        )}
-                        {stage.status === 'running' && (
-                          <div className="mt-1 h-0.5 bg-aether-cyan/20 rounded-full overflow-hidden">
-                            <div className="h-full bg-aether-cyan animate-shimmer rounded-full" style={{ width: '60%' }} />
-                          </div>
-                        )}
-                        {stage.status === 'completed' && stage.detail && (
-                          <p className="text-[8px] text-muted-foreground/70 truncate mt-0.5">{stage.detail}</p>
-                        )}
-                        {/* Stage number */}
-                        <span className="absolute top-1 right-1.5 text-[8px] font-mono text-muted-foreground/40">
-                          {idx + 1}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Pipeline flow connector */}
-                  <div className="hidden sm:flex items-center justify-center mt-3 gap-1">
-                    {STAGES.map((stage, idx) => (
-                      <React.Fragment key={stage.id}>
-                        <div
-                          className="w-2 h-2 rounded-full transition-colors duration-300"
-                          style={{
-                            backgroundColor:
-                              pipelineStages[idx].status === 'completed' ? '#22c55e' :
-                              pipelineStages[idx].status === 'running' ? '#00f0ff' :
-                              pipelineStages[idx].status === 'failed' ? '#ef4444' : '#333',
-                          }}
-                        />
-                        {idx < STAGES.length - 1 && (
-                          <div className="w-4 h-0.5 bg-border/30" />
-                        )}
-                      </React.Fragment>
-                    ))}
-                  </div>
-                </Card>
+        {/* Chat messages */}
+        <div className="flex-1 overflow-y-auto">
+          {!activeConvo || activeConvo.messages.length === 0 ? (
+            /* Empty state */
+            <div className="h-full flex flex-col items-center justify-center px-6">
+              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#00f0ff]/10 to-[#a855f7]/10 border border-white/[0.06] flex items-center justify-center mb-6">
+                <Zap className="w-8 h-8 text-[#00f0ff]" />
               </div>
-
-              {/* Stats Sidebar */}
-              <div className="space-y-3">
-                <StatCard
-                  title="Total Requests"
-                  value={stats?.totalRequests || 0}
-                  icon={<Activity className="w-4 h-4" />}
-                  color="#00f0ff"
-                />
-                <StatCard
-                  title="Cache Hit Rate"
-                  value={`${((stats?.cacheHitRate || 0) * 100).toFixed(1)}%`}
-                  icon={<Zap className="w-4 h-4" />}
-                  color="#eab308"
-                />
-                <StatCard
-                  title="ATD Pass Rate"
-                  value={`${((stats?.atdPassRate || 0) * 100).toFixed(1)}%`}
-                  icon={<Shield className="w-4 h-4" />}
-                  color="#22c55e"
-                />
-                <StatCard
-                  title="Avg Latency"
-                  value={`${stats?.avgLatencyMs || 0}ms`}
-                  icon={<Clock className="w-4 h-4" />}
-                  color="#a855f7"
-                />
-
-                {/* Complexity Breakdown */}
-                <Card className="glass-card p-3">
-                  <h3 className="text-[10px] font-mono text-muted-foreground mb-2 uppercase tracking-wider">Complexity Distribution</h3>
-                  <div className="space-y-2">
-                    <ComplexityBar label="Simple" count={stats?.simpleCount || 0} total={stats?.totalRequests || 1} color="#22c55e" />
-                    <ComplexityBar label="Moderate" count={stats?.moderateCount || 0} total={stats?.totalRequests || 1} color="#eab308" />
-                    <ComplexityBar label="Complex" count={stats?.complexCount || 0} total={stats?.totalRequests || 1} color="#ef4444" />
-                  </div>
-                </Card>
-
-                {/* HCM Status */}
-                <Card className="glass-card p-3">
-                  <div className="flex items-center gap-1.5 mb-2">
-                    <Eye className="w-3.5 h-3.5 text-aether-purple" />
-                    <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider">Holographic Memory</h3>
-                  </div>
-                  <div className="grid grid-cols-2 gap-1.5 text-[10px] font-mono">
-                    <div className="text-muted-foreground">Pairs</div>
-                    <div className="text-aether-purple text-right">{stats?.hcm?.pairCount || 0}</div>
-                    <div className="text-muted-foreground">Interference</div>
-                    <div className="text-aether-cyan text-right">{((stats?.hcm?.interference || 0) * 100).toFixed(2)}%</div>
-                    <div className="text-muted-foreground">Size</div>
-                    <div className="text-aether-green text-right">{((stats?.hcm?.memoryUsageBytes || 0) / 1024).toFixed(0)}KB</div>
-                  </div>
-                </Card>
-              </div>
-            </div>
-
-            {/* Models Grid */}
-            <Card className="glass-card p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <Cpu className="w-4 h-4 text-aether-purple" />
-                <h2 className="text-sm font-semibold">Model Fleet</h2>
-                <span className="text-[10px] font-mono text-muted-foreground">The Outfit Makes the Monk</span>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {(stats?.models || []).map((model) => (
-                  <div key={model.id} className="rounded-lg border border-border/30 bg-card/30 p-3 hover:border-aether-cyan/30 transition-colors">
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-xs font-semibold">{model.name}</span>
-                      <Badge className={`text-[8px] font-mono ${
-                        model.type === 'large' ? 'bg-aether-cyan/10 text-aether-cyan border-aether-cyan/20' :
-                        model.type === 'medium' ? 'bg-aether-purple/10 text-aether-purple border-aether-purple/20' :
-                        'bg-aether-green/10 text-aether-green border-aether-green/20'
-                      }`}>
-                        {model.type.toUpperCase()}
-                      </Badge>
-                    </div>
-                    <p className="text-[10px] text-muted-foreground mb-2">{model.provider}</p>
-                    <div className="flex flex-wrap gap-1">
-                      {model.capabilities.slice(0, 4).map(c => (
-                        <span key={c} className="text-[8px] px-1.5 py-0.5 rounded-full bg-secondary text-muted-foreground">
-                          {c}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
+              <h1 className="text-2xl font-bold mb-2">
+                <span className="text-[#00f0ff]">Aether</span>OS
+              </h1>
+              <p className="text-sm text-[#71717a] mb-8 text-center max-w-md">
+                Drop a GGUF in models/, power the cognitive pipeline, and watch a 1.2B model outperform a 70B. L&apos;habit fait le moine.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-lg">
+                {[
+                  { label: 'Design a distributed cache system', icon: <Database className="w-4 h-4" /> },
+                  { label: 'Compare React vs Vue architecture', icon: <GitBranch className="w-4 h-4" /> },
+                  { label: 'Explain quantum computing step by step', icon: <Brain className="w-4 h-4" /> },
+                  { label: 'Write a Rust implementation of B-tree', icon: <Terminal className="w-4 h-4" /> },
+                ].map((item, i) => (
+                  <button
+                    key={i}
+                    onClick={() => { setInputValue(item.label); }}
+                    className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.03] transition-colors text-left"
+                  >
+                    <div className="text-[#71717a]">{item.icon}</div>
+                    <span className="text-xs text-[#71717a]">{item.label}</span>
+                  </button>
                 ))}
               </div>
-            </Card>
-          </TabsContent>
-
-          {/* ═══ MODEL TAB ═══ */}
-          <TabsContent value="model" className="space-y-4">
-            {/* Model Status Hero */}
-            <Card className="glass-card p-6">
-              <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-                <div className="flex items-center gap-4">
-                  <div className={`w-14 h-14 rounded-2xl flex items-center justify-center ${
-                    inferenceStatus?.running
-                      ? 'bg-aether-green/10 border border-aether-green/30'
-                      : 'bg-aether-red/10 border border-aether-red/30'
-                  }`}>
-                    <Cpu className={`w-7 h-7 ${inferenceStatus?.running ? 'text-aether-green' : 'text-aether-red'}`} />
-                  </div>
-                  <div>
-                    <h2 className="text-lg font-bold">
-                      {inferenceStatus?.running ? 'Model Active' : 'No Model Loaded'}
-                    </h2>
-                    <p className="text-xs text-muted-foreground font-mono">
-                      {inferenceStatus?.running
-                        ? `${inferenceStatus.model} (${inferenceStatus.modelSize}) via ${inferenceStatus.backend}`
-                        : 'Drop a GGUF in models/ to power the cognitive pipeline'
-                      }
-                    </p>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  {inferenceStatus?.running ? (
-                    <Button
-                      onClick={handleStopModel}
-                      disabled={inferenceLoading}
-                      size="sm"
-                      className="bg-aether-red/20 text-aether-red hover:bg-aether-red/30 border border-aether-red/30"
-                    >
-                      <PowerOff className="w-3.5 h-3.5 mr-2" /> Stop
-                    </Button>
-                  ) : (
-                    <Button
-                      onClick={() => handleStartModel()}
-                      disabled={inferenceLoading || (inferenceStatus?.availableModels || 0) === 0}
-                      size="sm"
-                      className="bg-aether-green/20 text-aether-green hover:bg-aether-green/30 border border-aether-green/30"
-                    >
-                      <Power className="w-3.5 h-3.5 mr-2" /> Start
-                    </Button>
-                  )}
-                  <Button
-                    onClick={handleRefreshModels}
-                    size="sm"
-                    variant="outline"
-                    className="text-[10px]"
-                  >
-                    <RefreshCw className="w-3 h-3 mr-1" /> Scan
-                  </Button>
-                </div>
-              </div>
-            </Card>
-
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              {/* Available Models */}
-              <Card className="glass-card p-4 lg:col-span-2">
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <FileBox className="w-4 h-4 text-aether-cyan" />
-                    <h2 className="text-sm font-semibold">GGUF Models</h2>
-                    <Badge variant="outline" className="text-[10px] font-mono border-aether-cyan/30 text-aether-cyan">
-                      {inferenceStatus?.models?.length || 0} found
-                    </Badge>
-                  </div>
-                </div>
-
-                {(!inferenceStatus?.models || inferenceStatus.models.length === 0) ? (
-                  <div className="flex flex-col items-center justify-center py-12 text-center">
-                    <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-aether-cyan/5 to-aether-purple/5 border border-border/30 flex items-center justify-center mb-4 animate-float">
-                      <Download className="w-8 h-8 text-aether-cyan/50" />
-                    </div>
-                    <h3 className="text-sm font-semibold mb-1">No GGUF Models Found</h3>
-                    <p className="text-xs text-muted-foreground max-w-md mb-4">
-                      Drop a .gguf file in the <code className="text-aether-cyan bg-aether-cyan/10 px-1 rounded">models/</code> directory.
-                      Small models (1-3B params, Q4_K_M quantization) work best with the AetherOS pipeline — that&apos;s the whole point!
-                    </p>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-left max-w-md">
-                      <div className="rounded-lg border border-aether-green/20 bg-aether-green/5 p-2.5">
-                        <p className="text-[10px] font-mono text-aether-green mb-0.5">RECOMMENDED</p>
-                        <p className="text-xs font-semibold">1-3B Q4_K_M</p>
-                        <p className="text-[9px] text-muted-foreground">~700MB-1.8GB</p>
-                      </div>
-                      <div className="rounded-lg border border-aether-yellow/20 bg-aether-yellow/5 p-2.5">
-                        <p className="text-[10px] font-mono text-aether-yellow mb-0.5">GOOD</p>
-                        <p className="text-xs font-semibold">7B Q4_K_M</p>
-                        <p className="text-[9px] text-muted-foreground">~4GB</p>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {inferenceStatus.models.map(model => (
-                      <div
-                        key={model.filename}
-                        className={`flex items-center justify-between rounded-lg border p-3 transition-all ${
-                          inferenceStatus.running && inferenceStatus.model === model.filename
-                            ? 'border-aether-green/40 bg-aether-green/5'
-                            : 'border-border/30 bg-card/30 hover:border-aether-cyan/30'
-                        }`}
-                      >
-                        <div className="flex items-center gap-3">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                            inferenceStatus.running && inferenceStatus.model === model.filename
-                              ? 'bg-aether-green/20'
-                              : 'bg-secondary'
-                          }`}>
-                            <Cpu className={`w-4 h-4 ${
-                              inferenceStatus.running && inferenceStatus.model === model.filename
-                                ? 'text-aether-green'
-                                : 'text-muted-foreground'
-                            }`} />
-                          </div>
-                          <div>
-                            <p className="text-xs font-semibold font-mono">{model.filename}</p>
-                            <p className="text-[10px] text-muted-foreground">{model.sizeMB} MB</p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {inferenceStatus.running && inferenceStatus.model === model.filename && (
-                            <Badge className="text-[8px] bg-aether-green/10 text-aether-green border-aether-green/20">
-                              ACTIVE
-                            </Badge>
-                          )}
-                          {model.sizeMB < 2000 && (
-                            <Badge className="text-[8px] bg-aether-cyan/10 text-aether-cyan border-aether-cyan/20">
-                              OPTIMAL
-                            </Badge>
-                          )}
-                          {!inferenceStatus.running && (
-                            <Button
-                              onClick={() => handleStartModel(model.filename)}
-                              size="sm"
-                              variant="outline"
-                              className="text-[10px] border-aether-green/30 text-aether-green hover:bg-aether-green/10 h-7"
-                              disabled={inferenceLoading}
-                            >
-                              <Play className="w-3 h-3 mr-1" /> Load
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </Card>
-
-              {/* Engine Config & Info */}
-              <div className="space-y-4">
-                <Card className="glass-card p-4">
-                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">Engine Status</h3>
-                  <div className="space-y-2 text-[10px] font-mono">
-                    <div className="flex justify-between py-1.5 border-b border-border/20">
-                      <span className="text-muted-foreground">Backend</span>
-                      <span className="text-aether-cyan">{inferenceStatus?.backend || 'none'}</span>
-                    </div>
-                    <div className="flex justify-between py-1.5 border-b border-border/20">
-                      <span className="text-muted-foreground">Context</span>
-                      <span className="text-aether-purple">{inferenceStatus?.contextSize || 4096} tokens</span>
-                    </div>
-                    <div className="flex justify-between py-1.5 border-b border-border/20">
-                      <span className="text-muted-foreground">Port</span>
-                      <span className="text-aether-green">{inferenceStatus?.port || 8081}</span>
-                    </div>
-                    <div className="flex justify-between py-1.5">
-                      <span className="text-muted-foreground">Status</span>
-                      <span className={inferenceStatus?.running ? 'text-aether-green' : 'text-aether-red'}>
-                        {inferenceStatus?.running ? 'RUNNING' : 'STOPPED'}
-                      </span>
-                    </div>
-                  </div>
-                </Card>
-
-                <Card className="glass-card p-4">
-                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">The Thesis</h3>
-                  <div className="space-y-2 text-xs text-muted-foreground leading-relaxed">
-                    <p>
-                      A <span className="text-aether-cyan font-semibold">1.2B model</span> with the right scaffolding outperforms a <span className="text-aether-red font-semibold">70B model</span> flying blind.
-                    </p>
-                    <p>
-                      The pipeline <span className="text-aether-green">remembers FOR the model</span>, <span className="text-aether-purple">decomposes FOR the model</span>, and <span className="text-aether-yellow">verifies FOR the model</span>.
-                    </p>
-                    <p className="text-[10px] font-mono text-aether-orange">
-                      L&apos;habit fait le moine.
-                    </p>
-                  </div>
-                </Card>
-
-                <Card className="glass-card p-4">
-                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">Setup Guide</h3>
-                  <div className="space-y-1.5 text-[10px] font-mono">
-                    <div className="flex items-start gap-2 text-muted-foreground">
-                      <span className="text-aether-cyan">1.</span>
-                      <span>Download a GGUF model (HuggingFace)</span>
-                    </div>
-                    <div className="flex items-start gap-2 text-muted-foreground">
-                      <span className="text-aether-cyan">2.</span>
-                      <span>Drop it in <code className="text-aether-cyan">models/</code></span>
-                    </div>
-                    <div className="flex items-start gap-2 text-muted-foreground">
-                      <span className="text-aether-cyan">3.</span>
-                      <span>Install llama.cpp or Ollama</span>
-                    </div>
-                    <div className="flex items-start gap-2 text-muted-foreground">
-                      <span className="text-aether-cyan">4.</span>
-                      <span>Click Start — pipeline does the rest</span>
-                    </div>
-                  </div>
-                </Card>
-              </div>
             </div>
-          </TabsContent>
+          ) : (
+            <div className="max-w-[768px] mx-auto px-4 py-6">
+              {activeConvo.messages.map((msg) => (
+                <MessageBubble
+                  key={msg.id}
+                  message={msg}
+                  copiedId={copiedId}
+                  expandedThinking={expandedThinking.has(msg.id)}
+                  expandedPipeline={expandedPipeline.has(msg.id)}
+                  onToggleThinking={() => toggleThinking(msg.id)}
+                  onTogglePipeline={() => togglePipeline(msg.id)}
+                  onCopy={(text) => handleCopy(text, msg.id)}
+                />
+              ))}
 
-          {/* ═══ CHAT TAB ═══ */}
-          <TabsContent value="chat" className="h-[calc(100vh-160px)]">
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 h-full">
-              {/* Chat Panel */}
-              <div className="lg:col-span-2 flex flex-col h-full">
-                <Card className="glass-card flex-1 flex flex-col">
-                  {/* Chat Header */}
-                  <div className="p-3 border-b border-border/30 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <MessageSquare className="w-4 h-4 text-aether-purple" />
-                      <span className="text-sm font-semibold">Cognitive Chat</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={selectedModel}
-                        onChange={e => setSelectedModel(e.target.value)}
-                        className="text-[10px] font-mono bg-card border border-border/30 rounded px-2 py-1 text-foreground"
-                      >
-                        <option value="aether-pipeline">Auto (Pipeline)</option>
-                        <option value="aether-super-z">Super Z</option>
-                        <option value="aether-small-fast">Nano Agent</option>
-                      </select>
-                    </div>
+              {isGenerating && (
+                <div className="flex items-center gap-2 py-4">
+                  <div className="flex gap-1">
+                    <div className="w-1.5 h-1.5 bg-[#00f0ff] rounded-full animate-pulse" />
+                    <div className="w-1.5 h-1.5 bg-[#a855f7] rounded-full animate-pulse" style={{ animationDelay: '0.3s' }} />
+                    <div className="w-1.5 h-1.5 bg-[#ec4899] rounded-full animate-pulse" style={{ animationDelay: '0.6s' }} />
                   </div>
-
-                  {/* Messages */}
-                  <ScrollArea className="flex-1 p-4">
-                    {chatMessages.length === 0 && (
-                      <div className="flex flex-col items-center justify-center h-full text-center py-12">
-                        <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-aether-cyan/10 to-aether-purple/10 border border-border/30 flex items-center justify-center mb-4 animate-float">
-                          <Sparkles className="w-8 h-8 text-aether-cyan" />
-                        </div>
-                        <h3 className="text-sm font-semibold mb-1">AetherOS Cognitive Interface</h3>
-                        <p className="text-xs text-muted-foreground max-w-sm">
-                          Every message flows through a 10-stage cognitive pipeline that makes even small models think like super agents. Try asking something complex!
-                        </p>
-                        <div className="flex flex-wrap gap-2 mt-4">
-                          {[
-                            'Compare React vs Vue architecture',
-                            'Design a distributed cache system',
-                            'Explain quantum computing step by step',
-                          ].map(suggestion => (
-                            <button
-                              key={suggestion}
-                              onClick={() => setChatInput(suggestion)}
-                              className="text-[10px] px-2.5 py-1.5 rounded-full border border-border/30 bg-card/50 text-muted-foreground hover:text-aether-cyan hover:border-aether-cyan/30 transition-colors"
-                            >
-                              {suggestion}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="space-y-3">
-                      {chatMessages.map((msg, idx) => (
-                        <div
-                          key={idx}
-                          className={`rounded-lg p-3 ${
-                            msg.role === 'user' ? 'chat-message-user' : 'chat-message-assistant'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 mb-1.5">
-                            <span className="text-[10px] font-mono font-semibold uppercase">
-                              {msg.role === 'user' ? '⟩ You' : '⟨ Aether'}
-                            </span>
-                            {msg.complexity && (
-                              <Badge className={`text-[8px] font-mono ${
-                                msg.complexity === 'simple' ? 'bg-aether-green/10 text-aether-green' :
-                                msg.complexity === 'moderate' ? 'bg-aether-yellow/10 text-aether-yellow' :
-                                'bg-aether-red/10 text-aether-red'
-                              }`}>
-                                {msg.complexity}
-                              </Badge>
-                            )}
-                            {msg.cacheHit && (
-                              <Badge className="text-[8px] font-mono bg-aether-yellow/10 text-aether-yellow">
-                                CACHED
-                              </Badge>
-                            )}
-                            {msg.atdPassed && (
-                              <Badge className="text-[8px] font-mono bg-aether-green/10 text-aether-green">
-                                ATD ✓
-                              </Badge>
-                            )}
-                            {msg.latencyMs !== undefined && (
-                              <span className="text-[9px] font-mono text-muted-foreground">{msg.latencyMs}ms</span>
-                            )}
-                          </div>
-                          <p className="text-xs leading-relaxed whitespace-pre-wrap">{msg.content}</p>
-                        </div>
-                      ))}
-                      {isProcessing && (
-                        <div className="chat-message-assistant rounded-lg p-3">
-                          <div className="flex items-center gap-2">
-                            <div className="flex gap-1">
-                              <div className="w-1.5 h-1.5 bg-aether-cyan rounded-full animate-pulse-glow" />
-                              <div className="w-1.5 h-1.5 bg-aether-purple rounded-full animate-pulse-glow" style={{ animationDelay: '0.3s' }} />
-                              <div className="w-1.5 h-1.5 bg-aether-pink rounded-full animate-pulse-glow" style={{ animationDelay: '0.6s' }} />
-                            </div>
-                            <span className="text-[10px] font-mono text-muted-foreground">Pipeline processing...</span>
-                          </div>
-                        </div>
-                      )}
-                      <div ref={chatEndRef} />
-                    </div>
-                  </ScrollArea>
-
-                  {/* Input */}
-                  <div className="p-3 border-t border-border/30">
-                    <div className="flex gap-2">
-                      <Input
-                        value={chatInput}
-                        onChange={e => setChatInput(e.target.value)}
-                        onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleChatSubmit()}
-                        placeholder="Ask anything... the pipeline will handle the rest"
-                        className="text-xs bg-card/50 border-border/30 font-mono"
-                        disabled={isProcessing}
-                      />
-                      <Button
-                        onClick={handleChatSubmit}
-                        disabled={isProcessing || !chatInput.trim()}
-                        size="sm"
-                        className="bg-aether-cyan/20 text-aether-cyan hover:bg-aether-cyan/30 border border-aether-cyan/30"
-                      >
-                        <Send className="w-3.5 h-3.5" />
-                      </Button>
-                    </div>
-                  </div>
-                </Card>
-              </div>
-
-              {/* Pipeline Detail Sidebar */}
-              <div className="space-y-3">
-                <Card className="glass-card p-3">
-                  <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-3">Pipeline Stages</h3>
-                  <div className="space-y-1.5">
-                    {pipelineStages.map((stage, idx) => (
-                      <div key={stage.id} className="flex items-center gap-2 py-1">
-                        <div style={{ color: STAGES[idx].color }} className="flex-shrink-0">
-                          {STAGES[idx].icon}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-[10px] font-semibold truncate">{stage.label}</span>
-                            {stage.status === 'completed' && <CheckCircle2 className="w-3 h-3 text-aether-green flex-shrink-0" />}
-                            {stage.status === 'running' && <div className="w-2 h-2 border border-aether-cyan rounded-full animate-spin" />}
-                            {stage.status === 'failed' && <XCircle className="w-3 h-3 text-aether-red flex-shrink-0" />}
-                            {stage.status === 'skipped' && <span className="text-[8px] text-muted-foreground">SKIP</span>}
-                          </div>
-                          {stage.detail && (
-                            <p className="text-[8px] text-muted-foreground truncate">{stage.detail}</p>
-                          )}
-                        </div>
-                        {stage.durationMs > 0 && (
-                          <span className="text-[9px] font-mono text-muted-foreground">{stage.durationMs}ms</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </Card>
-
-                {/* Last message complexity info */}
-                {chatMessages.length > 0 && chatMessages[chatMessages.length - 1].role === 'assistant' && (
-                  <Card className="glass-card p-3">
-                    <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-2">Last Response Analysis</h3>
-                    <div className="space-y-1.5 text-[10px] font-mono">
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">Complexity</span>
-                        <span className="text-aether-cyan">{chatMessages[chatMessages.length - 1].complexity || '—'}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">Model</span>
-                        <span className="text-aether-purple">{chatMessages[chatMessages.length - 1].model || '—'}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">Latency</span>
-                        <span className="text-aether-green">{chatMessages[chatMessages.length - 1].latencyMs || '—'}ms</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">Cache Hit</span>
-                        <span className={chatMessages[chatMessages.length - 1].cacheHit ? 'text-aether-yellow' : 'text-muted-foreground'}>
-                          {chatMessages[chatMessages.length - 1].cacheHit ? 'Yes' : 'No'}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-muted-foreground">ATD Verified</span>
-                        <span className={chatMessages[chatMessages.length - 1].atdPassed ? 'text-aether-green' : 'text-aether-red'}>
-                          {chatMessages[chatMessages.length - 1].atdPassed ? 'Pass' : 'Fail'}
-                        </span>
-                      </div>
-                    </div>
-                  </Card>
-                )}
-              </div>
-            </div>
-          </TabsContent>
-
-          {/* ═══ AGENT TAB ═══ */}
-          <TabsContent value="agent" className="space-y-4">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Agent Control */}
-              <Card className="glass-card p-4">
-                <div className="flex items-center gap-2 mb-4">
-                  <Bot className="w-4 h-4 text-aether-green" />
-                  <h2 className="text-sm font-semibold">Autonomous Agent</h2>
-                  <span className="text-[10px] font-mono text-muted-foreground">Perceive → Think → Act → Observe</span>
-                </div>
-
-                <div className="space-y-3">
-                  <div>
-                    <label className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider">Goal</label>
-                    <Textarea
-                      value={agentGoal}
-                      onChange={e => setAgentGoal(e.target.value)}
-                      placeholder="What should the agent accomplish?"
-                      className="mt-1 text-xs bg-card/50 border-border/30 font-mono min-h-[80px]"
-                    />
-                  </div>
-
-                  <Button
-                    onClick={handleAgentRun}
-                    disabled={agentRunning || !agentGoal.trim()}
-                    className="w-full bg-aether-green/20 text-aether-green hover:bg-aether-green/30 border border-aether-green/30"
-                  >
-                    {agentRunning ? (
-                      <>
-                        <div className="w-3 h-3 border border-aether-green rounded-full animate-spin mr-2" />
-                        Agent Running...
-                      </>
-                    ) : (
-                      <>
-                        <Play className="w-3.5 h-3.5 mr-2" />
-                        Launch Agent
-                      </>
-                    )}
-                  </Button>
-
-                  {/* Agent Tools Reference */}
-                  <div className="border border-border/30 rounded-lg p-3">
-                    <h3 className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-2">Available Tools (12)</h3>
-                    <div className="grid grid-cols-2 gap-1">
-                      {['file_read', 'file_write', 'file_list', 'file_delete', 'exec', 'window_open', 'window_close', 'memory_add', 'memory_search', 'web_search', 'plan_create', 'plan_update'].map(tool => (
-                        <div key={tool} className="flex items-center gap-1 text-[9px] font-mono text-muted-foreground">
-                          <ChevronRight className="w-2 h-2 text-aether-cyan" />
-                          {tool}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </Card>
-
-              {/* Agent Result */}
-              <Card className="glass-card p-4">
-                <div className="flex items-center gap-2 mb-4">
-                  <Terminal className="w-4 h-4 text-aether-cyan" />
-                  <h2 className="text-sm font-semibold">Agent Output</h2>
-                </div>
-
-                {agentResult ? (
-                  <ScrollArea className="max-h-[500px]">
-                    <div className="space-y-3">
-                      <div className="flex items-center gap-2">
-                        <Badge className={agentResult.completed ? 'bg-aether-green/10 text-aether-green' : 'bg-aether-yellow/10 text-aether-yellow'}>
-                          {agentResult.completed ? 'COMPLETED' : 'IN PROGRESS'}
-                        </Badge>
-                        <span className="text-[10px] font-mono text-muted-foreground">
-                          {agentResult.iterations} iterations
-                        </span>
-                      </div>
-
-                      {/* Tool Calls */}
-                      {agentResult.toolCalls?.length > 0 && (
-                        <div className="space-y-1.5">
-                          <h4 className="text-[10px] font-mono text-muted-foreground">Tool Calls</h4>
-                          {agentResult.toolCalls.map((tc: any, i: number) => (
-                            <div key={i} className="rounded border border-border/30 bg-card/30 p-2">
-                              <div className="flex items-center gap-1.5 mb-1">
-                                <ChevronRight className="w-3 h-3 text-aether-cyan" />
-                                <span className="text-[10px] font-mono font-semibold text-aether-cyan">{tc.tool}</span>
-                              </div>
-                              <p className="text-[9px] font-mono text-muted-foreground pl-4">
-                                {JSON.stringify(tc.params).substring(0, 100)}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Iterations */}
-                      {agentResult.iterationsDetail?.map((iter: any, i: number) => (
-                        <div key={i} className="rounded border border-border/30 bg-card/30 p-2">
-                          <div className="flex items-center gap-1.5 mb-1">
-                            <span className="text-[10px] font-mono font-semibold text-aether-purple">Iteration {iter.iteration}</span>
-                            {iter.toolCall && (
-                              <Badge className="text-[8px] bg-aether-cyan/10 text-aether-cyan">
-                                {iter.toolCall.tool}
-                              </Badge>
-                            )}
-                          </div>
-                          <p className="text-[9px] text-muted-foreground line-clamp-3">{iter.thinking?.substring(0, 200)}</p>
-                        </div>
-                      ))}
-
-                      {/* Final Response */}
-                      <div className="rounded-lg border border-aether-green/30 bg-aether-green/5 p-3">
-                        <h4 className="text-[10px] font-mono text-aether-green mb-1">Final Response</h4>
-                        <p className="text-xs text-foreground whitespace-pre-wrap">{agentResult.finalResponse}</p>
-                      </div>
-                    </div>
-                  </ScrollArea>
-                ) : (
-                  <div className="flex flex-col items-center justify-center py-12 text-center">
-                    <Box className="w-10 h-10 text-muted-foreground/30 mb-3" />
-                    <p className="text-xs text-muted-foreground">Launch the agent to see output</p>
-                  </div>
-                )}
-              </Card>
-            </div>
-          </TabsContent>
-
-          {/* ═══ MEMORY TAB ═══ */}
-          <TabsContent value="memory" className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Database className="w-4 h-4 text-aether-orange" />
-                <h2 className="text-sm font-semibold">Semantic Memory Graph</h2>
-                <Badge variant="outline" className="text-[10px] font-mono border-aether-orange/30 text-aether-orange">
-                  {memoryNodes.length} nodes
-                </Badge>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  onClick={handleAddMemory}
-                  size="sm"
-                  variant="outline"
-                  className="text-[10px] border-aether-cyan/30 text-aether-cyan hover:bg-aether-cyan/10"
-                >
-                  <Plus className="w-3 h-3 mr-1" /> Add Memory
-                </Button>
-                <Button
-                  onClick={handleClearMemory}
-                  size="sm"
-                  variant="outline"
-                  className="text-[10px] border-aether-red/30 text-aether-red hover:bg-aether-red/10"
-                >
-                  <Trash2 className="w-3 h-3 mr-1" /> Clear
-                </Button>
-                <Button
-                  onClick={fetchMemory}
-                  size="sm"
-                  variant="outline"
-                  className="text-[10px]"
-                >
-                  <RefreshCw className="w-3 h-3 mr-1" /> Refresh
-                </Button>
-              </div>
-            </div>
-
-            <Card className="glass-card p-4">
-              {memoryNodes.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-16 text-center">
-                  <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-aether-orange/10 to-aether-purple/10 border border-border/30 flex items-center justify-center mb-4 animate-float">
-                    <GitBranch className="w-8 h-8 text-aether-orange" />
-                  </div>
-                  <h3 className="text-sm font-semibold mb-1">Memory Graph Empty</h3>
-                  <p className="text-xs text-muted-foreground max-w-sm mb-4">
-                    The semantic memory graph starts empty. It will auto-populate as you chat through the pipeline. Each conversation creates memory nodes with TF-IDF vectors.
-                  </p>
-                  <Button
-                    onClick={handleAddMemory}
-                    size="sm"
-                    className="bg-aether-orange/20 text-aether-orange hover:bg-aether-orange/30 border border-aether-orange/30"
-                  >
-                    <Plus className="w-3.5 h-3.5 mr-2" /> Add First Memory
-                  </Button>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                  {memoryNodes.map(node => (
-                    <div
-                      key={node.id}
-                      className="rounded-lg border border-border/30 bg-card/30 p-3 hover:border-aether-cyan/30 transition-colors"
-                    >
-                      <div className="flex items-center justify-between mb-2">
-                        <Badge className={`text-[8px] font-mono ${getCategoryStyle(node.category)}`}>
-                          {node.category}
-                        </Badge>
-                        <span className="text-[8px] font-mono text-muted-foreground">{node.id.substring(0, 8)}</span>
-                      </div>
-                      <p className="text-[10px] text-foreground leading-relaxed line-clamp-4">{node.text}</p>
-                    </div>
-                  ))}
+                  <span className="text-[11px] text-[#71717a]">Pipeline processing...</span>
                 </div>
               )}
-            </Card>
 
-            {/* HCM + Distillation Info */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <Card className="glass-card p-4">
-                <div className="flex items-center gap-2 mb-3">
-                  <Eye className="w-4 h-4 text-aether-purple" />
-                  <h3 className="text-sm font-semibold">Holographic Context Memory</h3>
-                </div>
-                <p className="text-[10px] text-muted-foreground mb-3">
-                  Fixed 16KB associative memory using Vector Symbolic Architectures + FFT. Never grows — absorbs infinite context with zero dynamic allocation.
-                </p>
-                <div className="grid grid-cols-4 gap-2">
-                  <div className="rounded-lg border border-border/30 bg-card/30 p-2 text-center">
-                    <p className="text-lg font-bold text-aether-purple">{stats?.hcm?.pairCount || 0}</p>
-                    <p className="text-[8px] text-muted-foreground">Pairs</p>
-                  </div>
-                  <div className="rounded-lg border border-border/30 bg-card/30 p-2 text-center">
-                    <p className="text-lg font-bold text-aether-cyan">1024</p>
-                    <p className="text-[8px] text-muted-foreground">Dims</p>
-                  </div>
-                  <div className="rounded-lg border border-border/30 bg-card/30 p-2 text-center">
-                    <p className="text-lg font-bold text-aether-green">{((stats?.hcm?.interference || 0) * 100).toFixed(1)}%</p>
-                    <p className="text-[8px] text-muted-foreground">Interference</p>
-                  </div>
-                  <div className="rounded-lg border border-border/30 bg-card/30 p-2 text-center">
-                    <p className="text-lg font-bold text-aether-orange">{stats?.distillationHits || 0}</p>
-                    <p className="text-[8px] text-muted-foreground">Distilled</p>
-                  </div>
-                </div>
-              </Card>
-
-              <Card className="glass-card p-4">
-                <div className="flex items-center gap-2 mb-3">
-                  <Search className="w-4 h-4 text-aether-cyan" />
-                  <h3 className="text-sm font-semibold">Graph + Cache Statistics</h3>
-                </div>
-                <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
-                  <div className="flex justify-between py-1.5 border-b border-border/20">
-                    <span className="text-muted-foreground">Graph Nodes</span>
-                    <span className="text-aether-cyan">{stats?.graphNodeCount || 0}</span>
-                  </div>
-                  <div className="flex justify-between py-1.5 border-b border-border/20">
-                    <span className="text-muted-foreground">Graph Edges</span>
-                    <span className="text-aether-purple">{stats?.graphEdgeCount || 0}</span>
-                  </div>
-                  <div className="flex justify-between py-1.5 border-b border-border/20">
-                    <span className="text-muted-foreground">Cache Entries</span>
-                    <span className="text-aether-yellow">{stats?.cacheEntries || 0}</span>
-                  </div>
-                  <div className="flex justify-between py-1.5 border-b border-border/20">
-                    <span className="text-muted-foreground">Hit Rate</span>
-                    <span className="text-aether-green">{((stats?.cacheHitRate || 0) * 100).toFixed(1)}%</span>
-                  </div>
-                  <div className="flex justify-between py-1.5">
-                    <span className="text-muted-foreground">Distillation</span>
-                    <span className="text-aether-orange">{stats?.distillationPatterns || 0} patterns</span>
-                  </div>
-                  <div className="flex justify-between py-1.5">
-                    <span className="text-muted-foreground">Avg Latency</span>
-                    <span className="text-foreground">{stats?.avgLatencyMs || 0}ms</span>
-                  </div>
-                </div>
-              </Card>
+              <div ref={chatEndRef} />
             </div>
-          </TabsContent>
-        </Tabs>
-      </main>
+          )}
+        </div>
 
-      {/* ─── Footer ─── */}
-      <footer className="mt-auto border-t border-border/30 bg-background/50 py-3">
-        <div className="max-w-[1800px] mx-auto px-4 flex items-center justify-between text-[9px] font-mono text-muted-foreground">
-          <div className="flex items-center gap-3">
-            <span>AetherOS v1.0.0</span>
-            <span className="text-border">|</span>
-            <span>Inspired by aether-engine</span>
-            <span className="text-border">|</span>
-            <span className="text-aether-cyan">L&apos;habit fait le moine</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <span>10-Stage Pipeline</span>
-            <span className="text-border">|</span>
-            <span>TF-IDF + HCM + ATD</span>
-            <span className="text-border">|</span>
-            <span>{stats?.totalRequests || 0} requests processed</span>
+        {/* Input area */}
+        <div className="border-t border-white/[0.04] bg-[#0a0a0f]">
+          <div className="max-w-[768px] mx-auto px-4 py-3">
+            <div className="flex items-end gap-2 rounded-2xl border border-white/[0.08] bg-[#12121a] px-4 py-3">
+              <textarea
+                ref={inputRef as any}
+                value={inputValue}
+                onChange={e => setInputValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }}}
+                placeholder="Message AetherOS..."
+                rows={1}
+                className="flex-1 bg-transparent text-sm resize-none outline-none placeholder:text-[#333] max-h-[200px] min-h-[24px]"
+                style={{ height: 'auto', overflow: 'hidden' }}
+                onInput={e => { const t = e.target as HTMLTextAreaElement; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 200) + 'px'; }}
+                disabled={isGenerating}
+              />
+              <button
+                onClick={handleSend}
+                disabled={isGenerating || !inputValue.trim()}
+                className={`p-2 rounded-lg transition-colors ${
+                  inputValue.trim() && !isGenerating
+                    ? 'bg-[#00f0ff] text-black hover:bg-[#00f0ff]/80'
+                    : 'bg-white/[0.04] text-[#333]'
+                }`}
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-[9px] text-[#333] text-center mt-2 font-mono">
+              AetherOS v2 · 10-stage cognitive pipeline · 100% local · L&apos;habit fait le moine
+            </p>
           </div>
         </div>
-      </footer>
+      </div>
+
+      {/* ═══ VFS PANEL ═══ */}
+      {showVFS && (
+        <div className="w-[300px] flex-shrink-0 flex flex-col border-l border-white/[0.06] bg-[#0d0d14]">
+          {/* VFS header */}
+          <div className="p-3 flex items-center justify-between border-b border-white/[0.04]">
+            <div className="flex items-center gap-2">
+              <FolderOpen className="w-4 h-4 text-[#a855f7]" />
+              <span className="text-xs font-semibold">Virtual File System</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <button onClick={handleNewFile} className="p-1 rounded hover:bg-white/5 text-[#71717a] hover:text-[#e4e4ef]">
+                <FileText className="w-3.5 h-3.5" />
+              </button>
+              <button onClick={handleFileUpload} className="p-1 rounded hover:bg-white/5 text-[#71717a] hover:text-[#e4e4ef]">
+                <Upload className="w-3.5 h-3.5" />
+              </button>
+              <button onClick={() => setShowVFS(false)} className="p-1 rounded hover:bg-white/5 text-[#71717a] hover:text-[#e4e4ef]">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+
+          {/* VFS search */}
+          <div className="px-3 py-2 border-b border-white/[0.04]">
+            <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <Search className="w-3 h-3 text-[#333]" />
+              <input
+                value={vfsSearchQuery}
+                onChange={e => setVfsSearchQuery(e.target.value)}
+                placeholder="Search files..."
+                className="flex-1 bg-transparent text-[10px] outline-none placeholder:text-[#333]"
+              />
+            </div>
+          </div>
+
+          {/* File tree or editor */}
+          {editingFile ? (
+            <div className="flex-1 flex flex-col">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.04]">
+                <div className="flex items-center gap-2">
+                  <Edit3 className="w-3 h-3 text-[#00f0ff]" />
+                  <span className="text-[10px] font-mono">{editingFile.name}</span>
+                </div>
+                <div className="flex gap-1">
+                  <button onClick={handleSaveFile} className="px-2 py-0.5 rounded text-[9px] bg-[#22c55e]/10 text-[#22c55e] hover:bg-[#22c55e]/20">
+                    Save
+                  </button>
+                  <button onClick={() => setEditingFile(null)} className="px-2 py-0.5 rounded text-[9px] text-[#71717a] hover:bg-white/5">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              <textarea
+                value={editContent}
+                onChange={e => setEditContent(e.target.value)}
+                className="flex-1 bg-transparent p-3 text-[10px] font-mono resize-none outline-none"
+                spellCheck={false}
+              />
+            </div>
+          ) : (
+            <ScrollArea className="flex-1">
+              <div className="p-2">
+                {vfsTree ? (
+                  <VFSTree
+                    node={vfsTree}
+                    vfs={vfs}
+                    selectedPath={selectedFile?.path}
+                    onSelect={(file) => { setSelectedFile(file); }}
+                    onEdit={(file) => { setEditingFile(file); setEditContent(file.content); }}
+                    onDelete={(path) => handleDeleteVFSFile(path)}
+                  />
+                ) : (
+                  <p className="text-[10px] text-[#333] text-center py-8">No files yet</p>
+                )}
+              </div>
+            </ScrollArea>
+          )}
+
+          {/* File preview */}
+          {selectedFile && !editingFile && (
+            <div className="border-t border-white/[0.04] max-h-[200px] overflow-auto">
+              <div className="flex items-center justify-between px-3 py-1.5">
+                <span className="text-[9px] font-mono text-[#71717a]">{selectedFile.path}</span>
+                <span className="text-[8px] font-mono text-[#333]">{selectedFile.size}B</span>
+              </div>
+              <pre className="px-3 pb-2 text-[9px] font-mono text-[#71717a] whitespace-pre-wrap break-all">
+                {selectedFile.content.substring(0, 500)}
+                {selectedFile.content.length > 500 ? '...' : ''}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 // ═══════════════════════════════════════════
-// Helper Components
+// Message Bubble Component — Z.ai style
 // ═══════════════════════════════════════════
 
-function StatCard({ title, value, icon, color }: { title: string; value: string | number; icon: React.ReactNode; color: string }) {
+function MessageBubble({
+  message,
+  copiedId,
+  expandedThinking,
+  expandedPipeline,
+  onToggleThinking,
+  onTogglePipeline,
+  onCopy,
+}: {
+  message: ChatMessage;
+  copiedId: string | null;
+  expandedThinking: boolean;
+  expandedPipeline: boolean;
+  onToggleThinking: () => void;
+  onTogglePipeline: () => void;
+  onCopy: (text: string) => void;
+}) {
+  const isUser = message.role === 'user';
+
   return (
-    <Card className="glass-card p-3">
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider">{title}</span>
-        <div style={{ color }}>{icon}</div>
-      </div>
-      <p className="text-xl font-bold font-mono" style={{ color }}>{value}</p>
-    </Card>
+    <div className={`py-4 ${isUser ? '' : ''}`}>
+      {isUser ? (
+        /* User message */
+        <div className="flex justify-end">
+          <div className="max-w-[85%] rounded-2xl rounded-br-md bg-[#1a1a2e] px-4 py-2.5">
+            <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+          </div>
+        </div>
+      ) : (
+        /* Assistant message */
+        <div className="flex gap-3">
+          {/* Avatar */}
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[#00f0ff]/20 to-[#a855f7]/20 border border-white/[0.06] flex items-center justify-center flex-shrink-0 mt-0.5">
+            <Zap className="w-3.5 h-3.5 text-[#00f0ff]" />
+          </div>
+
+          <div className="flex-1 min-w-0">
+            {/* Thinking accordion */}
+            {message.thinking && message.thinking.length > 0 && (
+              <div className="mb-2">
+                <button
+                  onClick={onToggleThinking}
+                  className="flex items-center gap-1.5 text-[11px] text-[#71717a] hover:text-[#a855f7] transition-colors"
+                >
+                  {expandedThinking ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                  <Sparkles className="w-3 h-3" />
+                  <span>Pipeline thinking</span>
+                  <span className="text-[9px] font-mono">({message.thinking.length} stages)</span>
+                </button>
+                {expandedThinking && (
+                  <div className="mt-1.5 space-y-1 pl-1">
+                    {message.thinking.map((block, i) => (
+                      <div key={i} className="flex items-start gap-2 text-[10px] font-mono">
+                        <div className={`w-1.5 h-1.5 rounded-full mt-1 flex-shrink-0 ${
+                          block.status === 'pass' ? 'bg-[#22c55e]' :
+                          block.status === 'fail' ? 'bg-[#ef4444]' : 'bg-[#00f0ff]'
+                        }`} />
+                        <div className="flex-1 min-w-0">
+                          <span className="text-[#71717a]">{block.label}</span>
+                          <span className="text-[#333] mx-1">·</span>
+                          <span className="text-[#555]">{block.content}</span>
+                          <span className="text-[#333] ml-1">{block.durationMs}ms</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Pipeline details accordion */}
+            {message.pipelineInfo && (
+              <div className="mb-2">
+                <button
+                  onClick={onTogglePipeline}
+                  className="flex items-center gap-1.5 text-[11px] text-[#71717a] hover:text-[#00f0ff] transition-colors"
+                >
+                  {expandedPipeline ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                  <Shield className="w-3 h-3" />
+                  <span>Pipeline details</span>
+                  <div className="flex items-center gap-1 ml-1">
+                    {message.pipelineInfo.atdPassed && <Badge className="text-[7px] bg-[#22c55e]/10 text-[#22c55e] h-4">ATD ✓</Badge>}
+                    {message.pipelineInfo.cacheHit && <Badge className="text-[7px] bg-[#eab308]/10 text-[#eab308] h-4">CACHED</Badge>}
+                    <Badge className={`text-[7px] h-4 ${
+                      message.pipelineInfo.complexity === 'complex' ? 'bg-[#ef4444]/10 text-[#ef4444]' :
+                      message.pipelineInfo.complexity === 'moderate' ? 'bg-[#eab308]/10 text-[#eab308]' :
+                      'bg-[#22c55e]/10 text-[#22c55e]'
+                    }`}>
+                      {message.pipelineInfo.complexity}
+                    </Badge>
+                  </div>
+                </button>
+                {expandedPipeline && (
+                  <div className="mt-1.5 grid grid-cols-5 gap-1">
+                    {message.pipelineInfo.stages.map((stage, i) => (
+                      <div
+                        key={stage.id}
+                        className={`rounded-md px-1.5 py-1 text-[8px] font-mono border ${
+                          stage.status === 'completed'
+                            ? 'border-[#22c55e]/20 bg-[#22c55e]/5 text-[#22c55e]'
+                            : stage.status === 'failed'
+                              ? 'border-[#ef4444]/20 bg-[#ef4444]/5 text-[#ef4444]'
+                              : 'border-white/[0.04] bg-white/[0.02] text-[#333]'
+                        }`}
+                      >
+                        <div className="font-semibold">{stage.label}</div>
+                        <div className="text-[7px] opacity-60">{stage.durationMs}ms</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Content */}
+            <div className="text-sm leading-relaxed prose-invert max-w-none">
+              <MessageContent content={message.content} />
+            </div>
+
+            {/* Actions */}
+            <div className="flex items-center gap-1 mt-2">
+              <button
+                onClick={() => onCopy(message.content)}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#333] hover:text-[#71717a] hover:bg-white/[0.03] transition-colors"
+              >
+                {copiedId === message.id ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                {copiedId === message.id ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
-function ComplexityBar({ label, count, total, color }: { label: string; count: number; total: number; color: string }) {
-  const pct = total > 0 ? (count / total) * 100 : 0;
+// ═══════════════════════════════════════════
+// Message Content — Basic Markdown Rendering
+// ═══════════════════════════════════════════
+
+function MessageContent({ content }: { content: string }) {
+  // Simple markdown: code blocks, bold, italic, headers, lists
+  const lines = content.split('\n');
+  const elements: React.ReactNode[] = [];
+  let inCodeBlock = false;
+  let codeContent = '';
+  let codeLang = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith('```') && !inCodeBlock) {
+      inCodeBlock = true;
+      codeLang = line.slice(3).trim();
+      codeContent = '';
+      continue;
+    }
+
+    if (line.startsWith('```') && inCodeBlock) {
+      inCodeBlock = false;
+      elements.push(
+        <div key={`code-${i}`} className="relative my-2 rounded-lg border border-white/[0.06] bg-[#0a0a0f] overflow-hidden">
+          {codeLang && (
+            <div className="px-3 py-1 border-b border-white/[0.04] text-[9px] font-mono text-[#333]">{codeLang}</div>
+          )}
+          <pre className="p-3 text-[11px] font-mono overflow-x-auto text-[#e4e4ef]/80">
+            {codeContent}
+          </pre>
+        </div>
+      );
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeContent += (codeContent ? '\n' : '') + line;
+      continue;
+    }
+
+    // Regular line rendering
+    if (line.startsWith('### ')) {
+      elements.push(<h3 key={`h3-${i}`} className="text-sm font-bold mt-3 mb-1">{formatInline(line.slice(4))}</h3>);
+    } else if (line.startsWith('## ')) {
+      elements.push(<h2 key={`h2-${i}`} className="text-base font-bold mt-4 mb-1">{formatInline(line.slice(3))}</h2>);
+    } else if (line.startsWith('# ')) {
+      elements.push(<h1 key={`h1-${i}`} className="text-lg font-bold mt-4 mb-2">{formatInline(line.slice(2))}</h1>);
+    } else if (line.startsWith('- ') || line.startsWith('* ')) {
+      elements.push(<div key={`li-${i}`} className="flex gap-2 ml-2"><span className="text-[#00f0ff]">•</span><span>{formatInline(line.slice(2))}</span></div>);
+    } else if (/^\d+\.\s/.test(line)) {
+      const match = line.match(/^(\d+\.)\s(.*)/);
+      elements.push(<div key={`oli-${i}`} className="flex gap-2 ml-2"><span className="text-[#a855f7] font-mono text-xs">{match?.[1]}</span><span>{formatInline(match?.[2] || '')}</span></div>);
+    } else if (line.trim() === '') {
+      elements.push(<div key={`br-${i}`} className="h-2" />);
+    } else {
+      elements.push(<p key={`p-${i}`} className="whitespace-pre-wrap">{formatInline(line)}</p>);
+    }
+  }
+
+  return <>{elements}</>;
+}
+
+function formatInline(text: string): React.ReactNode {
+  // Bold: **text**
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i} className="font-semibold text-[#e4e4ef]">{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return <code key={i} className="px-1 py-0.5 rounded bg-white/[0.06] text-[#00f0ff] text-[11px] font-mono">{part.slice(1, -1)}</code>;
+    }
+    return part;
+  });
+}
+
+// ═══════════════════════════════════════════
+// VFS Tree Component
+// ═══════════════════════════════════════════
+
+function VFSTree({
+  node,
+  vfs,
+  selectedPath,
+  onSelect,
+  onEdit,
+  onDelete,
+  depth = 0,
+}: {
+  node: VFSNode;
+  vfs: VirtualFileSystem;
+  selectedPath?: string;
+  onSelect: (file: VFSFile) => void;
+  onEdit: (file: VFSFile) => void;
+  onDelete: (path: string) => void;
+  depth?: number;
+}) {
+  const [expanded, setExpanded] = useState(true);
+
+  if (node.name === '/' && node.children.length === 0) {
+    return (
+      <div className="text-center py-6">
+        <FolderOpen className="w-6 h-6 text-[#333] mx-auto mb-2" />
+        <p className="text-[10px] text-[#333]">No files yet</p>
+        <p className="text-[9px] text-[#222]">Upload or create files</p>
+      </div>
+    );
+  }
+
   return (
     <div>
-      <div className="flex items-center justify-between text-[10px] mb-0.5">
-        <span className="text-muted-foreground">{label}</span>
-        <span className="font-mono" style={{ color }}>{count} ({pct.toFixed(0)}%)</span>
-      </div>
-      <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-        <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: color }} />
-      </div>
+      {node.name !== '/' && (
+        <div
+          className={`group flex items-center gap-1.5 py-1 px-2 rounded-md cursor-pointer hover:bg-white/[0.03] transition-colors ${
+            selectedPath === node.path ? 'bg-[#a855f7]/5 text-[#a855f7]' : 'text-[#71717a]'
+          }`}
+          style={{ paddingLeft: `${depth * 12 + 8}px` }}
+          onClick={() => {
+            if (node.type === 'directory') {
+              setExpanded(!expanded);
+            } else if (node.file) {
+              onSelect(node.file);
+            }
+          }}
+        >
+          {node.type === 'directory' ? (
+            <>
+              {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+              <Folder className="w-3.5 h-3.5 text-[#eab308]" />
+            </>
+          ) : (
+            <>
+              <span className="w-3" />
+              <File className="w-3.5 h-3.5 text-[#00f0ff]" />
+            </>
+          )}
+          <span className="text-[10px] font-mono truncate flex-1">{node.name}</span>
+          {node.type === 'file' && (
+            <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity">
+              <button onClick={e => { e.stopPropagation(); node.file && onEdit(node.file); }} className="p-0.5 hover:text-[#00f0ff]">
+                <Edit3 className="w-2.5 h-2.5" />
+              </button>
+              <button onClick={e => { e.stopPropagation(); onDelete(node.path); }} className="p-0.5 hover:text-[#ef4444]">
+                <Trash2 className="w-2.5 h-2.5" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {expanded && node.children.map(child => (
+        <VFSTree
+          key={child.path}
+          node={child}
+          vfs={vfs}
+          selectedPath={selectedPath}
+          onSelect={onSelect}
+          onEdit={onEdit}
+          onDelete={onDelete}
+          depth={node.name === '/' ? 0 : depth + 1}
+        />
+      ))}
     </div>
   );
-}
-
-function getStageDetail(stageId: string, query: string): string {
-  const details: Record<string, string> = {
-    'cache_check': 'Cache miss — proceeding through pipeline',
-    'graph_retrieval': `Retrieved nodes via TF-IDF + 1-hop expansion`,
-    'context_compression': 'Compressed from ~40K to 4K chars',
-    'complexity_analysis': 'Classified as moderate',
-    'decomposition': 'Decomposed into 3 sub-questions',
-    'solve': 'Solved 3 sub-questions sequentially',
-    'synthesis': 'Synthesized from 3 sub-answers',
-    'atd_verification': 'ATD passed — likelihood > entropy',
-    'distillation': 'Pattern stored for future reuse',
-    'speculative_prefetch': 'Prefetched 3 related queries',
-  };
-  return details[stageId] || '';
-}
-
-function getCategoryStyle(category: string): string {
-  const styles: Record<string, string> = {
-    'fact': 'bg-aether-cyan/10 text-aether-cyan',
-    'lesson': 'bg-aether-yellow/10 text-aether-yellow',
-    'plan': 'bg-aether-purple/10 text-aether-purple',
-    'goal': 'bg-aether-green/10 text-aether-green',
-    'intention': 'bg-aether-pink/10 text-aether-pink',
-    'log': 'bg-aether-orange/10 text-aether-orange',
-    'code': 'bg-secondary text-muted-foreground',
-  };
-  return styles[category] || styles['fact'];
 }

@@ -52,3 +52,12 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# AetherOS specific
+.zscripts/
+tool-results/
+download/
+mini-services/
+scripts/
+worklog.md
+.cache/
